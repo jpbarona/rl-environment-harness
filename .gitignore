@@ -1,0 +1,32 @@
+# Generated capture data, test evidence, and local exports
+/work/
+/capture-store/
+/exports/
+/logs/
+
+# Dependencies, build output, and test caches
+node_modules/
+/dist/
+/coverage/
+/.cache/
+/.vitest/
+*.tsbuildinfo
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+/secrets/
+opencode.local.json
+
+# Local operating-system and editor files
+.DS_Store
+._*
+*.swp
+*.swo
+*~

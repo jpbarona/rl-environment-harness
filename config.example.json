@@ -1,0 +1,22 @@
+# Example OpenCode project configuration for the harness tests.
+# Placeholders only. No real model identifiers, API keys, or limits.
+# Copy to a git-ignored file before use.
+
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openrouter": {
+      "npm": "@openrouter/ai-sdk-provider",
+      "options": {
+        "baseURL": "http://127.0.0.1:0/recorder-placeholder",
+        "apiKey": "{placeholder: never commit a real key}"
+      }
+    }
+  },
+  "model": "{placeholder: user-configured task model}",
+  "smoke_test": {
+    "model": "{placeholder: user-configured low-cost model}",
+    "timeout_seconds": "{placeholder: user-configured integer}",
+    "max_tool_executions": "{placeholder: user-configured integer}"
+  }
+}
