@@ -133,3 +133,37 @@ These are unresolved questions, not factual claims. **Next action:** draft the c
 **Verified observation:** Added an explicit five-step implementation plan to the design draft. Each step has ordered substeps, deliverables, an acceptance gate, and blocker handling. Added requirements for isolated configuration, active-session selection, capture failure barriers, dependency pins, fixture evidence, data exclusion, export completeness, original-input comparison, deterministic output, and one-step execution discipline. [Citation: outputs/design.md, section “Implementation plan: execute one numbered step at a time”; file-write operation in this turn.]
 
 **Status:** Planning artifacts prepared for relocation. Implementation has not started. Architecture and tool behavior remain subject to the stated validation gates. **Next action:** relocate both documents, then execute Step 1 in the target repository when requested.
+
+## Entry 007 — Step 1 complete: repository scaffold and frozen test contract
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent.  
+**Date:** 2026-10-08, evening, America/New_York.  
+**Status:** Step 1 PASS. Steps 2-5 not started. Nothing beyond the initial commit has been committed at user instruction.
+
+### Work performed
+
+1. **Repository initialized and initial commit made before any changes.** `git init` then root commit `cd29e4f` containing only `agent-log.md` and `design.md`. [Evidence: git output in this session: "Initialized empty Git repository", "[main (root-commit) cd29e4f] Initial commit ... 2 files changed".] No commit was made after implementation, per user instruction "do NOT commit at the end".
+2. **Scaffold created:** `src/` (`index.ts`, `turn.ts`), `tests/` (`turn.test.ts`, `fixtures/README.md`), `docs/` (`versions.md`, `acceptance.md`), `config.example.json`, `.gitignore`, `package.json`, `package-lock.json`, `tsconfig.json`, `vitest.config.ts`. [Evidence: git status in this turn lists these as untracked additions; directory listing confirms them.]
+3. **Language/runtime/test choices (per user approval in this session):** TypeScript 5.9, Node >=22 (installed v25.8.0 satisfies), Vitest 3.2, npm 11.11.0 as package manager. pnpm was rejected because `pnpm --version` returned "command not found". [Evidence: `node --version` = v25.8.0; `npm --version` = 11.11.0; `pnpm --version` = command not found; `docs/versions.md` records all versions with commands.]
+4. **Strictest type checking enabled:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `noImplicitOverride`, `noImplicitReturns`, `noFallthroughCasesInSwitch`, `noPropertyAccessFromIndexSignature`, `noUnusedLocals`, `noUnusedParameters`, `allowUnreachableCode: false`, `verbatimModuleSyntax`, `isolatedModules`. [Evidence: tsconfig.json committed in working tree; `npm run typecheck` (tsc --noEmit) exits 0.]
+5. **Fixture specification written:** `tests/fixtures/README.md` defines the two-turn fixture with tracked modification, untracked file, required ignored file, deletion, symlink, executable bit, and a mid-conversation selected turn. [Evidence: file content; matches design.md Step 1 substep 6 requirements.]
+6. **Acceptance contract written:** `docs/acceptance.md` pins the user-turn boundary (capture completes before first model call or tool action; capture failure seals the turn fail-closed), first-version scope (idle sessions, one declared workspace), the five deterministic checks, and PASS/FAIL/INCONCLUSIVE semantics. [Evidence: file content; mirrors the design draft's check table.]
+7. **Scaffold code encodes the contract:** `src/turn.ts` implements a `TurnRegistry` enforcing: activity rejected before capture commits (fail closed), checkpoint command rejected as a turn, sealed turns reject all activity. Nine unit tests cover fail-closed ordering, sealing, isolation of turn state, and multi-turn independence. [Evidence: `npm run test` output: "Tests 9 passed (9)", duration 292 ms; `npm run verify` (typecheck + tests) exits 0.]
+8. **Ignore rules added:** `work/` (generated evidence), `node_modules/`, `dist/`, `.env*`, `*.pem`, `secrets/`, `opencode.local.json`. `config.example.json` contains placeholders only. [Evidence: `git check-ignore -v` confirms node_modules ignored; config.example.json contains no real identifiers or keys.]
+
+### Corrections and deviations
+
+- Initial tsconfig used `rootDir: src` with tests included; `tsc --noEmit` failed with TS6059. Fixed by removing `rootDir`/`outDir` (typecheck is noEmit only). [Evidence: TS6059 error output in this session, followed by clean typecheck.]
+- `@types/node` was initially omitted; TS2688 followed. Added at ~22.12.0 to satisfy vite 7's peer range. [Evidence: TS2688 error output; npm install log.]
+- User ran `npm install` manually because all agent terminal commands are capped at 5 seconds and the install exceeded it. [Evidence: user message "added 51 packages in 16s".]
+
+### Verified version evidence
+
+- OpenCode v2.0.18 at `~/.opencode/bin/opencode` (not on `PATH`); `--help` documents `OPENCODE_CONFIG` and `OPENCODE_PERMISSION` for project-local isolation. [Evidence: commands run in this session; output recorded in docs/versions.md.]
+- Docker client 28.5.1 present; daemon and image builds not exercised. Container validation is a Step 3 prerequisite, per the acceptance gate in design.md Step 1. [Evidence: `docker --version` output only; no container commands run.]
+
+### Acceptance-gate result
+
+**PASS.** `npm run verify` exits 0. No secrets or capture data tracked. Version evidence recorded in docs/versions.md. Container tooling recorded as a prerequisite for Step 3.
+
+**Next step:** Step 2 — prove the capture boundary (plugin + recorder against a mock model endpoint).

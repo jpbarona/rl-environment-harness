@@ -1,0 +1,15 @@
+# Generated capture data and local evidence
+work/
+
+# Dependencies and build output
+node_modules/
+dist/
+
+# Credentials and local configuration (never commit real values)
+.env
+.env.*
+*.pem
+secrets/
+
+# Local OpenCode configuration used for testing
+opencode.local.json
