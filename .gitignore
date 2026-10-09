@@ -1,15 +1,32 @@
-# Generated capture data and local evidence
-work/
+# Generated capture data, test evidence, and local exports
+/work/
+/capture-store/
+/exports/
+/logs/
 
-# Dependencies and build output
+# Dependencies, build output, and test caches
 node_modules/
-dist/
+/dist/
+/coverage/
+/.cache/
+/.vitest/
+*.tsbuildinfo
 
-# Credentials and local configuration (never commit real values)
+# Credentials and local configuration
 .env
 .env.*
+!.env.example
+!.env.*.example
 *.pem
-secrets/
-
-# Local OpenCode configuration used for testing
+*.key
+*.p12
+*.pfx
+/secrets/
 opencode.local.json
+
+# Local operating-system and editor files
+.DS_Store
+._*
+*.swp
+*.swo
+*~
