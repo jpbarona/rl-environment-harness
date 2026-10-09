@@ -499,3 +499,46 @@ Earlier fixture iterations failed and were corrected: request text arrived with 
 ### Step 2 completion
 
 All six requirements have passing evidence at the current revision; type checking, unit tests, and required real OpenCode integration tests pass; this entry records the revision, command results, and evidence paths. **Step 2 is COMPLETE.** Stopping here per the gate; Step 3 not started.
+
+## Entry 014 — Optional zero-cost live-provider capture suite
+
+**Author:** Codex primary agent. **Date:** 2026-10-09, America/New_York. **Status:** Implemented; live inference pending a dedicated credential.
+
+- **User requirement:** An opt-in suite must exercise several turns with a cheap real tool-capable model after major changes, with a maximum $0.01 model spend. [Citation: user instruction beginning “yeah it should be a very very cheap or free model”.]
+- **Implementation:** `npm run test:live` runs the existing verification suite, followed by `tests/live/capture.live.test.ts`; normal verification excludes live inference. The live case uses the production plugin/proxy with three real OpenCode turns and verifies pre-turn object bytes, identities, model input persistence, tool gates, session continuity, and absence of the provider key in capture storage. [Citation: package.json; tests/live/capture.live.test.ts; src/capture/e2e.ts.]
+- **Budget controls:** The suite rejects credentials without an account-side key limit at or below $0.01. Model selection requires advertised tool support, a `:free` identifier, and all listed prices equal to zero. The forwarding gateway rejects other model identifiers and caps inference requests at 18, with 1,024 output tokens per request; no paid model fallback is configured. [Citation: tests/live/capture.live.test.ts; https://openrouter.ai/docs/api/api-reference/api-keys/get-current-key; https://openrouter.ai/api/v1/models.]
+- **Test result:** Type checking, 38 unit tests, and five real OpenCode integration tests passed after adding the live transport configuration. [Citation: npm run verify, local execution on 2026-10-09 at 16:50 America/New_York.]
+- **Coverage boundary:** Controlled failure injection, compaction, truncation, and artifact barriers remain in the existing deterministic suite; the live case verifies the ordinary provider/tool path. Live-provider success is unverified until a test credential is configured. [Citation: tests/e2e/capture.e2e.test.ts; tests/capture.test.ts; tests/live/capture.live.test.ts.]
+- **Next action:** Configure a dedicated test key with a $0.01 limit as OPENROUTER_API_KEY, then execute npm run test:live. [Citation: docs/live-capture-test.md; user reply agreeing a new test key may be appropriate.]
+
+
+## Entry 015 — Step 3 acceptance baseline and live-test verification
+
+**Author:** Codex primary agent. **Date:** 2026-10-09, America/New_York. **Status:** Step 3 requirements documented; implementation not started.
+
+- **Verified test result:** npm run test:live passed type checking, 38 unit tests, five real OpenCode integration tests, and a three-turn real-provider case using apodex/apodex-1.1-mini:free. The success record reports 0 USD based on zero-price catalog selection, not independently queried billing. [Citation: work/e2e/live-free-1791581385378-iguxbs/live-result.json; local npm run test:live output, 2026-10-09 17:29 America/New_York.]
+- **Observed discrepancy:** The live suite key-limit check currently accepts 0.10 USD although the user requirement and documentation specify 0.01 USD; free-model restriction remains present. No account/key modification was performed in this review. [Citation: tests/live/capture.live.test.ts keyData.data.limit check; docs/live-capture-test.md; user instruction setting a 0.01 USD cap.]
+- **Normative baseline:** docs/step-3-requirements.md defines seven restoration requirements, source/evidence directory structure, real container/OpenCode scenarios, negative tests, bounded failure behavior, and completion/change-control rules. It separates no-forward input reconstruction from Step 4 packaging and live retry. [Citation: docs/step-3-requirements.md; user request for an informed Step 3 requirement list and explicit directory structure.]
+- **Documentation update:** design.md now identifies Step 3 as the next step and links its acceptance authority; docs/acceptance.md links the same baseline. The append-only log was preserved. [Citation: design.md implementation-plan handoff and Step 3 section; docs/acceptance.md; this append operation.]
+- **Next action:** Implement Step 3 against S3-R1–R7; do not add review requirements without user approval. [Citation: docs/step-3-requirements.md authority and completion gate.]
+
+
+## Entry 016 — Modular documentation revision authorized by user
+
+**Author:** Codex primary agent. **Date:** 2026-10-09, America/New_York. **Status:** Planning documents revised; no implementation changes in this revision.
+
+- **User authorization:** Revise design and requirement documents after agreeing that Step 3 restores files/context in a container and Step 4 arranges a portable task layout. Do not touch code. [Citation: user messages beginning “so 3 basically kind of dumps it into a container” and “perfect. i like that … dont touch code”.]
+- **Normative plan:** Step 3 implements restoration and input equality; Step 4 exports and checks portable layout using Step 3; Step 5 integrates !checkpoint, reused checks, and bounded real-provider/tool execution; Step 6 deploys the same workflow. Steps 1/2 remain completed history and frozen Step 2 requirements were not modified. [Citation: design.md build-step table; docs/step-3-requirements.md; docs/step-4-requirements.md; docs/step-5-requirements.md.]
+- **Workspace layout requirement:** Step 3 now explicitly compares the complete container workspace tree, including directories, file types, misplaced/unexpected entries, deleted-file absence, permissions, and links. Step 4 validates the external package layout and portability; these are distinct structures and share the same restore engine. [Citation: docs/step-3-requirements.md S3-R2; docs/step-4-requirements.md S4-R2/S4-R3; user instruction that Step 3 must test the expected file structure.]
+- **Format verification:** Harbor documents instruction.md, task.toml, environment/, and tests/ as task components, with verifier reward output separate from environment execution. The plan labels exports as Harbor-shaped candidates with a custom capture extension, without claiming native evaluation compatibility from names alone. [Citation: https://docs.harborframework.com/tasks/overview, retrieved this turn; design.md package layout; docs/step-4-requirements.md S4-R4.]
+- **Follow-up, not a change performed here:** The live-capture key check accepts 0.10 USD while the user cap is 0.01 USD. The documentation preserves the agreed 0.01 USD target and does not modify that code or credentials. [Citation: tests/live/capture.live.test.ts current key-limit comparison; docs/step-5-requirements.md known follow-up.]
+- **Next action:** Implement only Step 3 against its seven requirements and record passing evidence before portable packaging. [Citation: design.md current position and implementation rules.]
+
+
+## Entry 017 — User-approved budget correction
+
+**Author:** Codex primary agent. **Date:** 2026-10-09, America/New_York. **Status:** Documentation corrected; code unchanged.
+
+- **User requirement:** The user raised the live-test cap to 0.10 USD. [Citation: user correction “i raised the cap to 0.1”.]
+- **Correction to Entries 015/016:** Their description of the 0.10 USD key limit as an outstanding mismatch is superseded by this authorization. Updated design.md, docs/live-capture-test.md, and docs/step-5-requirements.md to use the 0.10 USD cap. Prior entries remain intact. [Citation: user correction; named documentation files.]
+- **Implementation observation:** The existing key-limit check accepts at most 0.10 USD; the free-model restriction remains present. No code or account configuration was changed in this documentation correction. [Citation: tests/live/capture.live.test.ts keyData.data.limit comparison and eligible model filter; this file-write operation.]

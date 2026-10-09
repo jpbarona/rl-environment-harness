@@ -14,6 +14,8 @@ const OPENCODE_BIN = resolve(
 export interface E2EOptions {
   /** Test name; creates a unique run directory under work/e2e/. */
   readonly name: string;
+  /** Optional real-provider transport. Tests still use the production plugin/proxy. */
+  readonly live?: { readonly upstreamURL: string; readonly model: string; readonly apiKey: string };
   readonly failCapture?: boolean;
   readonly captureDelayMs?: number;
   readonly script?: MockScript;
@@ -168,8 +170,8 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
   mkdirSync(isoHome, { recursive: true });
 
   const proxy = new CaptureProxy({
-    upstreamURL: `${mockURL}/v1`,
-    mainModel: "mock-model",
+    upstreamURL: options.live?.upstreamURL ?? `${mockURL}/v1`,
+    mainModel: options.live?.model ?? "mock-model",
     trace,
     workspaceRoot: workspace,
     captureStoreDir: captureStore,
@@ -206,8 +208,8 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
         formatter: false,
         lsp: false,
         compaction: { auto: true, reserved: 60000 },
-        model: "capture-mock/mock-model",
-        small_model: "capture-mock/mock-small",
+        model: `capture-mock/${options.live?.model ?? "mock-model"}`,
+        small_model: `capture-mock/${options.live?.model ?? "mock-small"}`,
         provider: {
           "capture-mock": {
             npm: "@ai-sdk/openai-compatible",
@@ -219,7 +221,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
               apiKey: "{env:CAPTURE_MOCK_API_KEY}",
             },
             models: {
-              "mock-model": {
+              [options.live?.model ?? "mock-model"]: {
                 name: "Mock Task Model",
                 ...(options.probe?.compaction === true ? { limit: { context: 100000, output: 2000 } } : {}),
               },
@@ -264,7 +266,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
         TMPDIR: join(runDir, "tmp"),
         OPENCODE_CONFIG: configPath,
         CAPTURE_SERVICE_URL: proxyURL,
-        CAPTURE_MOCK_API_KEY: "e2e-runtime-only-key",
+        CAPTURE_MOCK_API_KEY: options.live?.apiKey ?? "e2e-runtime-only-key",
         NO_COLOR: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],

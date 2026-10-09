@@ -9,10 +9,11 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude 'tests/e2e/**'",
+    "test": "vitest run --exclude 'tests/e2e/**' --exclude 'tests/live/**'",
     "test:e2e": "vitest run tests/e2e",
     "test:watch": "vitest",
-    "verify": "npm run typecheck && npm run test && npm run test:e2e"
+    "verify": "npm run typecheck && npm run test && npm run test:e2e",
+    "test:live": "set -a && source .env && set +a && npm run verify && vitest run tests/live"
   },
   "devDependencies": {
     "@types/node": "~22.12.0",

@@ -2,6 +2,12 @@
 
 **Step 2 authority:** [Frozen Step 2 requirements](step-2-requirements.md) define the current finish line and supersede conflicting Step 2 wording below. Later-step checks remain separate.
 
+**Step 3 authority:** [Step 3 requirements](step-3-requirements.md) define restoration acceptance. Portable task packaging is Step 4. The !checkpoint command and model-backed runtime smoke test are Step 5.
+
+**Step 4 authority:** [Package requirements](step-4-requirements.md).
+
+**Step 5 authority:** [Checkpoint requirements](step-5-requirements.md).
+
 The checks below mirror the deterministic-check table in the MVP
 design draft and make the user-turn boundary exact. Each check has a
 pass condition; a check that cannot run is a failure of that step's
@@ -36,14 +42,14 @@ pre-request state has been durably saved. The boundary is:
 | Check | Pass condition |
 |---|---|
 | Package integrity | All required records, file objects, and runtime image references are available. |
-| Workspace restoration | File contents, paths, permissions, and symbolic links match the capture. |
+| Workspace restoration | The complete directory/file set, contents, paths, types, permissions, and symbolic links match the capture; missing, misplaced, deleted, or unexpected entries are checked. |
 | Context restoration | Request, prior context, tool definitions, and model settings match. Later messages are absent. |
 | Runtime health | The container starts. Required tools and dependencies are available. |
 | Tool execution | A known file can be read. A temporary probe file can be written, read, and deleted. |
 
 ## Status semantics
 
-- `PASS` — package is ready for replay.
+- `PASS` — the invoked step's required checks passed. Restore equality, package portability, agent runtime health, and RL reward validity are separate claims.
 - `FAIL` — a required check failed.
 - `INCONCLUSIVE` — a test limit prevented a decision (for example a
   model timeout).
