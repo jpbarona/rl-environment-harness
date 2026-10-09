@@ -38,6 +38,8 @@ export interface TurnRecord {
   captureAttempts: number;
   /** Whether per-request context files were persisted for this turn. */
   contextSaved: boolean;
+  /** Referenced tool-output artifacts captured for this turn. */
+  artifacts?: Array<{ originalPath: string; sha256: string }>;
   /** Authoritative state supplied by the integration, not inferred from prose. */
   requiredState?: RequiredTurnState;
 }
@@ -128,6 +130,8 @@ export class CaptureProxy {
   readonly #server: http.Server;
   /** Turn identity dedupe: "sessionId:messageId" -> turnId. */
   readonly #identityToTurn = new Map<string, string>();
+  /** Latest turn per session (artifact events can outlive the window). */
+  readonly #lastTurnBySession = new Map<string, string>();
   readonly turns = new Map<string, TurnRecord>();
   readonly requests: RecordedRequest[] = [];
   #requestIndex = 0;
@@ -271,6 +275,48 @@ export class CaptureProxy {
       this.#options.trace.append("execution.window.confirmed", {});
     } else if (parsed.type === "execution.ended") {
       this.#closeWindow();
+    } else if (parsed.type === "tool.output.artifact") {
+      // Truncation artifacts are discovered mid-execution, after the
+      // turn's context was saved; capture them into the open turn. The
+      // file may not be flushed yet — wait bounded, then fail closed.
+      const d = (parsed.data ?? {}) as { sessionID?: unknown; path?: unknown };
+      const turnId =
+        typeof d.sessionID === "string" ? this.#lastTurnBySession.get(d.sessionID) : undefined;
+      const turn = turnId !== undefined ? this.turns.get(turnId) : undefined;
+      if (turn !== undefined && typeof d.path === "string") {
+        void this.#captureArtifactWithWait(turn, d.path).catch((err: unknown) => {
+          this.#options.trace.append("artifact.capture.failed", {
+            turnId: turn.id,
+            path: d.path,
+            message: String(err),
+          });
+          this.#sealFailure(turn, err instanceof Error ? err : new Error(String(err)));
+        });
+      }
+    }
+  }
+
+  /** Capture an artifact, waiting bounded for its file to appear. */
+  async #captureArtifactWithWait(turn: TurnRecord, path: string): Promise<void> {
+    const attempts = 8;
+    const waitMs = 250;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        this.#captureArtifact(turn, path);
+        if (turn.contextSaved && turn.checkpointId !== null) {
+          this.#writeReferencedArtifacts(
+            turn,
+            join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId),
+          );
+        }
+        return;
+      } catch (err) {
+        const missing = err instanceof Error && "code" in err && (err as { code?: unknown }).code === "ENOENT";
+        if (!missing || attempt === attempts) {
+          throw err;
+        }
+        await delay(waitMs);
+      }
     }
   }
 
@@ -347,6 +393,7 @@ export class CaptureProxy {
     };
     this.turns.set(turnId, turn);
     this.#identityToTurn.set(key(sessionId, messageId), turnId);
+    this.#lastTurnBySession.set(sessionId, turnId);
     this.#window = { turnId, sessionId, messageId };
     this.#captureGate = this.#runCaptureFor(turn).then(
       () => {
@@ -584,6 +631,42 @@ export class CaptureProxy {
     await this.#forward(req, res, body, auth, recorded);
   }
 
+  /** Capture one referenced artifact into the shared object store. */
+  #captureArtifact(turn: TurnRecord, path: string): void {
+    const existing = (turn.artifacts ??= []).find(a => a.originalPath === path);
+    if (existing !== undefined) {
+      return;
+    }
+    const source = realpathSync(path);
+    const permitted = (this.#options.artifactRoots ?? []).some(root => {
+      const rel = relative(realpathSync(root), source);
+      return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+    });
+    if (!permitted) throw new Error(`required artifact outside allowed roots: ${path}`);
+    const content = readFileSync(source);
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    writeFileSync(join(this.#options.captureStoreDir, "objects", sha256), content);
+    turn.artifacts?.push({ originalPath: path, sha256 });
+    this.#options.trace.append("artifact.captured", {
+      turnId: turn.id,
+      originalPath: path,
+      sha256,
+      bytes: content.length,
+    });
+  }
+
+  /** Rewrite referenced_artifacts.json from the turn's captured artifacts. */
+  #writeReferencedArtifacts(turn: TurnRecord, dir: string): void {
+    if (turn.checkpointId === null) {
+      return;
+    }
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "referenced_artifacts.json"),
+      `${JSON.stringify(turn.artifacts ?? [])}\n`,
+    );
+  }
+
   /**
    * Incoming path validation. Rejects absolute URLs, protocol-relative
    * URLs, and any path that is not a provider chat-completions endpoint.
@@ -805,20 +888,10 @@ export class CaptureProxy {
     if (required !== undefined) {
       writeFileSync(join(dir, "session_state.json"), `${JSON.stringify(required.priorSessionState ?? null)}\n`);
       writeFileSync(join(dir, "compaction.json"), `${JSON.stringify(required.compaction ?? null)}\n`);
-      const artifacts: Array<{ originalPath: string; sha256: string }> = [];
       for (const path of required.referencedToolOutputFiles ?? []) {
-        const source = realpathSync(path);
-        const permitted = (this.#options.artifactRoots ?? []).some(root => {
-          const rel = relative(realpathSync(root), source);
-          return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
-        });
-        if (!permitted) throw new Error(`required artifact outside allowed roots: ${path}`);
-        const content = readFileSync(source);
-        const sha256 = createHash("sha256").update(content).digest("hex");
-        writeFileSync(join(this.#options.captureStoreDir, "objects", sha256), content);
-        artifacts.push({ originalPath: path, sha256 });
+        this.#captureArtifact(turn, path);
       }
-      writeFileSync(join(dir, "referenced_artifacts.json"), `${JSON.stringify(artifacts)}\n`);
+      this.#writeReferencedArtifacts(turn, dir);
       saved.push("session_state.json", "compaction.json", "referenced_artifacts.json");
     }
 

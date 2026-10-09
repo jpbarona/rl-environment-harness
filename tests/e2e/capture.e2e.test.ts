@@ -311,3 +311,104 @@ function scanFilesForKey(dir: string, secret: string): string[] {
   walk(dir);
   return hits;
 }
+
+describe("real compaction and truncation (OpenCode v2.0.18)", () => {
+  it(
+    "compaction: OpenCode compacts a full context and the hook identifies the compaction calls authoritatively",
+    async () => {
+      const env = await createE2E({
+        name: "compaction",
+        probe: { compaction: true },
+      });
+      cleanups.push(env.cleanup);
+
+      const r1 = await env.runPrompt("FILL the context please");
+      expect(r1.code, `opencode run failed. stderr:\n${r1.stderr}`).toBe(0);
+
+      // A follow-up turn pushes the filled context past the compaction
+      // threshold; OpenCode compacts before its next provider call.
+      const r2 = await env.runPrompt("and then reply briefly", {
+        continueLast: true,
+      });
+      expect(r2.code, `opencode run failed. stderr:\n${r2.stderr}`).toBe(0);
+
+      // The hook classified at least one provider call as compaction,
+      // authoritatively (x-capture-purpose header, not prompt strings).
+      const authoritative = env.trace.filter("classification.authoritative");
+      expect(
+        authoritative.some((e) => e.data["basis"] === "background-compaction"),
+        `expected an authoritative compaction classification; got ${JSON.stringify(authoritative.map((e) => e.data["basis"]))}`,
+      ).toBe(true);
+
+      // Task traffic stays primary even across compaction.
+      const taskRequests = env.proxy.requests.filter((r) => r.model === "mock-model" && !r.background);
+      expect(taskRequests.some((r) => r.classification === "task-new-turn")).toBe(true);
+
+      // The compaction calls were recorded as background and forwarded.
+      const compactionRequests = env.proxy.requests.filter((r) => r.background);
+      expect(compactionRequests.length).toBeGreaterThan(0);
+
+      removeRunDirCheck(env);
+    },
+    E2E_TIMEOUT,
+  );
+
+  it(
+    "truncation: truncated shell output is captured as a referenced artifact from its saved-file path",
+    async () => {
+      const env = await createE2E({
+        name: "truncation",
+        probe: { truncation: true, compaction: false },
+      });
+      cleanups.push(env.cleanup);
+
+      const r = await env.runPrompt("USE_TOOL_BIG write huge output");
+      expect(r.code, `opencode run failed. stderr:\n${r.stderr}`).toBe(0);
+      expect(r.stdout.includes("done big"), `unexpected stdout:\n${r.stdout.slice(0, 400)}`).toBe(true);
+
+      // Artifact capture is asynchronous (bounded wait for the flushed
+      // file); poll for it before asserting.
+      const deadline = Date.now() + 8000;
+      while (
+        Date.now() < deadline &&
+        env.trace.filter("artifact.captured").length === 0
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      expect(
+        env.trace.filter("artifact.captured").length,
+        "no artifact.captured event within 8 s",
+      ).toBeGreaterThan(0);
+
+      // The upstream saw the truncated inline tool output (a tool-result
+      // round), proving execution end-to-end.
+      const toolRound = env.mock.observations.find((o) => o.sawToolOutput);
+      expect(toolRound, "the tool result round must reach the upstream").toBeDefined();
+
+      // The plugin identified the saved-output artifact path; the proxy
+      // captured it into the shared object store and referenced it.
+      const checkpointsDir = join(env.runDir, "capture-store", "checkpoints");
+      const ckpt = readdirSync(checkpointsDir)[0];
+      expect(typeof ckpt).toBe("string");
+      const refs = JSON.parse(
+        readFileSync(join(checkpointsDir, ckpt ?? "", "referenced_artifacts.json"), "utf8"),
+      ) as Array<{ originalPath: string; sha256: string }>;
+      expect(
+        refs.some((a) => a.originalPath.includes("/shell/") && a.originalPath.endsWith(".out")),
+        `expected a shell-output artifact in ${JSON.stringify(refs)}`,
+      ).toBe(true);
+      for (const ref of refs) {
+        const objectPath = join(env.runDir, "capture-store", "objects", ref.sha256);
+        expect(existsSync(objectPath), `artifact object missing: ${objectPath}`).toBe(true);
+      }
+
+      // No unsupported-state failures: the capture report lists the
+      // artifacts as saved, not unsupported.
+      const report = env.trace.filter("capture.report").at(-1);
+      expect(report?.data["unsupported"]).toHaveLength(0);
+
+      removeRunDirCheck(env);
+    },
+    E2E_TIMEOUT,
+  );
+});

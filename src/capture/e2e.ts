@@ -3,8 +3,9 @@ import { mkdirSync, writeFileSync, chmodSync, symlinkSync, existsSync, rmSync } 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { CaptureProxy } from "./proxy.js";
-import { MockModelServer, type MockScript } from "./mock-model.js";
+import { MockModelServer, defaultScript, type MockScript } from "./mock-model.js";
 import { EventTrace } from "./trace.js";
+import { writeCapturePlugin } from "./plugin.js";
 
 const OPENCODE_BIN = resolve(
   join(process.env["HOME"] ?? "", ".opencode/bin/opencode"),
@@ -16,6 +17,11 @@ export interface E2EOptions {
   readonly failCapture?: boolean;
   readonly captureDelayMs?: number;
   readonly script?: MockScript;
+  /**
+   * Discovery probes: force OpenCode compaction with a tiny model context
+   * limit, and force tool-output truncation with huge tool outputs.
+   */
+  readonly probe?: { readonly compaction?: boolean; readonly truncation?: boolean };
 }
 
 export interface E2EEnv {
@@ -69,6 +75,11 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
   writeFileSync(join(workspace, "notes.md"), "# notes\nversion-1\n");
   writeFileSync(join(workspace, "obsolete.txt"), "obsolete content\n");
   writeFileSync(join(workspace, "run.sh"), "#!/bin/sh\necho ok\n");
+  writeFileSync(
+    join(workspace, "big-output.sh"),
+    "#!/bin/sh\nhead -c 80000 /dev/zero | tr '\\0' 'y'\n",
+  );
+  chmodSync(join(workspace, "big-output.sh"), 0o755);
   chmodSync(join(workspace, "run.sh"), 0o755);
   symlinkSync("notes.md", join(workspace, "link-to-notes"));
 
@@ -88,7 +99,63 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
   });
 
   const trace = new EventTrace(traceFile);
-  const mock = new MockModelServer(options.script);
+  const probeScript: MockScript | undefined =
+    options.probe?.compaction === true || options.probe?.truncation === true
+      ? ({ lastUserText, sawToolOutput }) => {
+          if (options.probe?.truncation === true && lastUserText.includes("USE_TOOL_BIG")) {
+            if (!sawToolOutput) {
+              return {
+                toolCalls: [
+                  {
+                    id: "call_big",
+                    name: "shell",
+                    args: { command: "./big-output.sh", description: "produce huge output" },
+                  },
+                ],
+              };
+            }
+            return { content: "done big" };
+          }
+          if (options.probe?.compaction === true && lastUserText.includes("FILL")) {
+            return { content: `filler.\n${"y".repeat(200000)}` };
+          }
+          if (lastUserText.startsWith("You MUST summarize")) {
+            // OpenCode validates the compaction summary against its template;
+            // return a minimal compliant summary.
+            return {
+              content: [
+                "## Objective",
+                "- Exercise the capture harness compaction probe.",
+                "",
+                "## Requirements",
+                "- None beyond the probe.",
+                "",
+                "## Decisions",
+                "- None.",
+                "",
+                "## Work State",
+                "- Context was filled to trigger compaction; compaction ran.",
+                "",
+                "## Next Move",
+                "- Continue the probe; exercise the shell tool.",
+                "",
+                "## Relevant Files",
+                "- big-output.sh",
+                "",
+                "## Important Context",
+                "- Mock model environment; no external services.",
+              ].join("\n"),
+            };
+          }
+          return undefined;
+        }
+      : undefined;
+  const mock = new MockModelServer(
+    options.script ??
+      (probeScript !== undefined
+        ? (input) => probeScript(input) ?? defaultScript(input)
+        : undefined),
+  );
   const mockURL = await mock.start();
 
   // Paths needed for runtime references; computed before the proxy so the
@@ -104,6 +171,9 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
     workspaceRoot: workspace,
     captureStoreDir: captureStore,
     captureDelayMs: options.captureDelayMs ?? 0,
+    // Shell tool truncation artifacts are written under the isolated
+    // OpenCode data dir; allow them as capture roots.
+    ...(options.probe?.truncation === true ? { artifactRoots: [join(home, "data")] } : {}),
     runtime: {
       opencodeVersion: "2.0.18",
       configPath,
@@ -114,116 +184,9 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
   });
   const proxyURL = await proxy.start();
 
-  // Project-local plugin: forwards events and tool activity to the proxy.
-  // OpenCode v2.0.18 requires a default export { id, setup(ctx) } and
-  // exposes events via the async-iterable ctx.event.subscribe() stream
-  // (payload body under event.data). Verified against the installed binary
-  // and https://opencode.ai/v2/docs/build/plugins (2026-10-08).
-  const pluginDir = join(workspace, ".opencode", "plugins");
-  mkdirSync(pluginDir, { recursive: true });
-  writeFileSync(
-    join(pluginDir, "capture-plugin.ts"),
-    `export default {
-  id: "capture-plugin",
-  async setup(ctx) {
-    const url = process.env.CAPTURE_SERVICE_URL
-    const send = async (type, data) => {
-      const response = await fetch(url + "/events", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ type, data }), signal: AbortSignal.timeout(10000),
-      })
-      if (!response.ok) throw new Error("capture event rejected: " + await response.text())
-    }
-    const identities = new Map()
-    await ctx.session.hook("prompt", async event => {
-      const sessionID = event.sessionID
-      const messageID = event.messageID
-      const session = await ctx.session.get({ sessionID })
-      const messages = await ctx.session.context({ sessionID })
-      const compaction = messages.filter(message => message.type === "compaction")
-      const unsupported = []
-      for (const message of messages) {
-        for (const part of message.content ?? []) {
-          if (part.type === "tool" && part.state?.metadata?.truncated === true) {
-            unsupported.push("truncated tool output requires a verified external artifact path")
-          }
-        }
-      }
-      identities.set(sessionID, messageID)
-      await send("user.message", { sessionID, messageID, text: event.prompt.text,
-        requiredState: { priorSessionState: { session, messages }, compaction, unsupported },
-      })
-      const response = await fetch(url + "/capture-gate", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sessionID, messageID }), signal: AbortSignal.timeout(10000),
-      })
-      if (!response.ok) throw new Error("capture admission gate rejected: " + await response.text())
-    })
-    await ctx.tool.hook("execute.before", async event => {
-      const sessionID = event.sessionID
-      const messageID = identities.get(sessionID)
-      const response = await fetch(url + "/tool-gate", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sessionID, messageID }), signal: AbortSignal.timeout(10000),
-      })
-      if (!response.ok) throw new Error("capture tool gate rejected: " + await response.text())
-      send("tool.start", { sessionID, messageID })
-    })
-    await ctx.session.hook("http.request", event => {
-      event.request.headers.set("x-capture-purpose", event.kind)
-      event.request.headers.set("x-capture-session", event.sessionID)
-    })
-    const sampled = new Set()
-    const pick = (v, keys) => {
-      const out = {}
-      for (const k of keys) {
-        if (v && typeof v === "object" && v[k] !== undefined) out[k] = v[k]
-      }
-      return out
-    }
-    ;(async () => {
-      for await (const event of ctx.event.subscribe()) {
-        const type = String(event?.type ?? "")
-        if (type === "session.created") {
-          send("session.created", pick(event.data, ["sessionID", "parentID"]))
-        } else if (type === "session.inbox.enqueued") {
-          const d = event.data ?? {}
-          const item = d.item ?? {}
-          if (item.type === "user") {
-            identities.set(d.sessionID, d.inboxID)
-            const session = await ctx.session.get({ sessionID: d.sessionID })
-            const messages = await ctx.session.context({ sessionID: d.sessionID })
-            await send("user.message", {
-              sessionID: d.sessionID, messageID: d.inboxID, text: item.payload?.text,
-              requiredState: { priorSessionState: { session, messages } },
-            })
-          }
-        } else if (type === "session.execution.started") {
-          send("execution.started", {
-            ...pick(event.data, ["sessionID", "messageID", "id"]),
-          })
-        } else if (type.startsWith("session.execution.")) {
-          send("execution.ended", { kind: type, ...pick(event.data, ["sessionID"]) })
-        } else if (type === "message.updated") {
-          const d = event.data ?? {}
-          const info = d.info ?? {}
-          send("message.updated", {
-            sessionID: info.sessionID ?? d.sessionID,
-            id: info.id ?? d.id ?? d.messageID,
-            role: info.role ?? d.role,
-          })
-        }
-        if (!sampled.has(type) && !["session.created", "session.execution.started", "session.inbox.enqueued", "message.updated"].includes(type)) {
-          sampled.add(type)
-          send("event.sample." + type, { json: JSON.stringify(event).slice(0, 1200) })
-        }
-      }
-    })().catch(() => {})
-    return () => {}
-  },
-}
-`,
-  );
+  // Reusable capture plugin wiring (see src/capture/plugin.ts).
+  const pluginPath = writeCapturePlugin(workspace, writeFileSync, mkdirSync);
+  void pluginPath;
 
   // Isolated OpenCode config: only the mock provider, pointing at the
   // proxy. Stored inside the workspace as a project config so project
@@ -238,6 +201,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
         share: "disabled",
         formatter: false,
         lsp: false,
+        compaction: { auto: true, reserved: 60000 },
         model: "capture-mock/mock-model",
         small_model: "capture-mock/mock-small",
         provider: {
@@ -251,7 +215,10 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
               apiKey: "{env:CAPTURE_MOCK_API_KEY}",
             },
             models: {
-              "mock-model": { name: "Mock Task Model" },
+              "mock-model": {
+                name: "Mock Task Model",
+                ...(options.probe?.compaction === true ? { limit: { context: 100000, output: 2000 } } : {}),
+              },
               "mock-small": { name: "Mock Small Model" },
             },
           },

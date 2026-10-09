@@ -418,3 +418,39 @@ Earlier fixture iterations failed and were corrected: request text arrived with 
 **User requirement:** Remaining integration tests must use real OpenCode to produce compaction and large tool output, rather than mocking those behaviors. A deterministic fake model endpoint can remain the controlled provider; no paid model call is required for the integration contract. [Citation: user exchange “and for the tests we use real opencode not a load of mocks” and subsequent request for this handoff.]
 
 **Status:** Step 2 remains incomplete. **Next action:** complete these integrations and fixtures; run the existing regression suite; append exact evidence and limitations. Do not start Step 3 or make a Git commit without user instruction.
+
+## Entry 012 — Step 2 completion: reusable plugin, real compaction test, truncation artifact capture
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent.  
+**Date:** 2026-10-09, afternoon, America/New_York.  
+**Status:** All three remaining Step 2 items implemented and verified. Branch `attempt-1`; changes uncommitted per the standing no-commit-at-end instruction. Step 3 not started.
+
+### Implementation
+
+1. **Reusable plugin wiring extracted.** The capture plugin source moved from an inline fixture template to `src/capture/plugin.ts` (`CAPTURE_PLUGIN_SOURCE` + `writeCapturePlugin`), the single source of truth for the fixture and any deployed harness. A new unit test (`tests/plugin-source.test.ts`) writes the source to a temp module and imports it, guarding against template-escape corruption — which caught two real bugs during this entry (see corrections).
+2. **Real OpenCode compaction test.** The e2e fixture gains a `probe.compaction` mode: the mock task model declares `limit: {context: 100000, output: 2000}` with `compaction: {auto: true, reserved: 60000}`, and the mock returns a 200,000-character filler response to push the context past the compaction threshold. A follow-up `--continue` turn triggers OpenCode's compaction before its next provider call. The test asserts: both runs exit 0; at least one provider call is classified `background-compaction` AUTHORITATIVELY via the `x-capture-purpose` hook header (not prompt strings); task traffic stays primary. Verified fact: OpenCode's compaction validation rejects summaries that do not match its required template (`Compaction summary did not match the required template`); the mock now returns a template-compliant summary with the exact section headings captured from a real compaction request body (Objective, Requirements, Decisions, Work State, Next Move, Relevant Files, Important Context).
+3. **Truncation artifact capture.** Verified OpenCode truncation behavior: a shell tool producing 80,000 characters delivers ~51,433 characters inline and the model-visible text ends with `[showing lines 1-1 of 1; full output saved to <path>]`, where `<path>` is a file under the isolated OpenCode data dir (`home/data/opencode/shell/<hash>/<id>.out`). The plugin now extracts that path from `session.tool.success` events (`tool.output.artifact` event to the proxy). The proxy captures the artifact mid-execution — after context save, resolving the turn by session ID (`#lastTurnBySession`, because the event can outlive the execution window) — validates the path against `artifactRoots`, stores the content in the shared object store, and writes `referenced_artifacts.json` with originalPath + sha256. The file may not be flushed when the event arrives: the capture waits bounded (8 × 250 ms) for ENOENT, then fails closed (`artifact.capture.failed` + turn sealed). The fixture declares the isolated OpenCode data dir as an artifact root when the truncation probe is on.
+
+### Test evidence
+
+- `npm run typecheck` exits 0. [Evidence: command output.]
+- `npm run test` = 34 passed (includes the new plugin-module load guard). [Evidence: vitest output.]
+- `npx vitest run tests/e2e` = 5 passed: the three hardened tests plus real-compaction (1.6 s) and truncation (1.2 s). [Evidence: vitest output; E2E_EXIT=0.]
+- Truncation run evidence (`work/e2e/truncation-*/trace.jsonl` and capture store): `tool.output.artifact` plugin event with the saved-output path; `artifact.captured` in the trace; `referenced_artifacts.json` contains the shell `.out` path with sha256 `cbdd412b...`; the object exists in the shared store; `capture.report.unsupported` is empty.
+- Compaction run evidence: `classification.authoritative` with basis `background-compaction`; task calls remain `task-new-turn`/primary.
+
+### Corrections made during this entry
+
+- The plugin template's regexes were silently corrupted by template-literal escaping: `\s` cooked down to `s` and `\]` to `]`, so the generated regex `(.+)s*$` matched by luck and the artifact regex never matched. Fixed by doubling backslashes in template regexes and adding the module-load guard test.
+- The truncation artifact path initially captured a trailing `]` (the marker's closing bracket); the regex now excludes it.
+- The first compaction probe used a 2000-token context limit, smaller than OpenCode's own agent system prompt, which overflow-failed every run before compaction could help; replaced with a realistic limit plus high compaction pressure.
+
+### Remaining gaps
+
+1. `ctx.session.context({sessionID})` returns an empty message list on OpenCode v2.0.18 (observed in plugin events); the plugin therefore sources prior-session state and truncation metadata from the event stream and prompt-hook arguments. If a future version changes event payloads, the plugin must be updated.
+2. The compaction mock summary is template-compliant but content-free; OpenCode accepts it. A richer summary matters only for replay realism (Step 3).
+3. Artifact capture trusts the path marker in the tool text. A malicious or buggy tool could plant an arbitrary path; mitigation is the `artifactRoots` allowlist plus content-addressed storage (both in place).
+
+### Step 2 status
+
+**DONE.** All three remaining items are implemented and verified against real OpenCode v2.0.18. No known blockers remain for starting Step 3.
