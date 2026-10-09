@@ -939,3 +939,191 @@ describe("CaptureProxy: execution-frame identity and capture barrier", () => {
     rmSync(store, { recursive: true, force: true });
   });
 });
+describe("CaptureProxy: R5 artifact barrier", () => {
+  function taskBodyWithMarker(prompt: string, artifactPath: string, model = "mock-model"): unknown {
+    return {
+      model,
+      messages: [
+        { role: "user", content: prompt },
+        { role: "tool", content: `yy  [showing lines 1-1 of 1; full output saved to ${artifactPath}]` },
+      ],
+    };
+  }
+
+  it("a missing required artifact seals the turn; later requests stay blocked", async () => {
+    const ws = makeTemp();
+    const store = makeTemp();
+    const trace = new EventTrace();
+    const mock = await startUpstream();
+    const proxy = new CaptureProxy({
+      upstreamURL: `${mock.url}/v1`,
+      mainModel: "mock-model",
+      trace,
+      workspaceRoot: ws,
+      captureStoreDir: store,
+      artifactRoots: [makeTemp()],
+      identityTimeoutMs: 1000,
+    });
+    const url = await proxy.start();
+
+    await postEvent(url, ...spreadIdentity(identity("s1", "m1", "artifact turn")));
+    await postEvent(url, "execution.started", { sessionID: "s1" });
+
+    // The plugin reports a truncation artifact that never appears on disk.
+    await postEvent(url, "tool.output.artifact", {
+      sessionID: "s1",
+      messageID: "m1",
+      path: join(makeTemp(), "does-not-exist.out"),
+    });
+    await sleep(2400); // bounded retry: 8 x 250 ms
+    expect(trace.events.some((e) => e.type === "artifact.capture.failed")).toBe(true);
+
+    // The turn is sealed: a task request cannot proceed.
+    const res = await post(url, taskBody("artifact turn"));
+    expect(res.status).toBe(502);
+    expect(mock.observations.length).toBe(0);
+    expect(trace.events.some((e) => e.type === "request.forwarded")).toBe(false);
+
+    await proxy.stop();
+    await mock.stop();
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(store, { recursive: true, force: true });
+  });
+
+  it("an artifact outside allowed roots seals the turn", async () => {
+    const ws = makeTemp();
+    const store = makeTemp();
+    const trace = new EventTrace();
+    const mock = await startUpstream();
+    const proxy = new CaptureProxy({
+      upstreamURL: `${mock.url}/v1`,
+      mainModel: "mock-model",
+      trace,
+      workspaceRoot: ws,
+      captureStoreDir: store,
+      artifactRoots: [makeTemp()], // does NOT contain the artifact below
+    });
+    const url = await proxy.start();
+
+    const outsideDir = makeTemp();
+    const outsideFile = join(outsideDir, "outside.out");
+    writeFileSync(outsideFile, "disallowed");
+
+    await postEvent(url, ...spreadIdentity(identity("s1", "m1", "root policy turn")));
+    await postEvent(url, "execution.started", { sessionID: "s1" });
+    await postEvent(url, "tool.output.artifact", {
+      sessionID: "s1",
+      messageID: "m1",
+      path: outsideFile,
+    });
+    await sleep(300);
+    expect(trace.events.some((e) => e.type === "artifact.capture.failed")).toBe(true);
+
+    const res = await post(url, taskBody("root policy turn"));
+    expect(res.status).toBe(502);
+    expect(mock.observations.length).toBe(0);
+
+    await proxy.stop();
+    await mock.stop();
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(store, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  it("a late artifact event binds to its producing turn, not the open one", async () => {
+    const ws = makeTemp();
+    const store = makeTemp();
+    const trace = new EventTrace();
+    const mock = await startUpstream();
+    const artifactRoot = makeTemp();
+    const artifactFile = join(artifactRoot, "late.out");
+    writeFileSync(artifactFile, "late artifact content");
+    const proxy = new CaptureProxy({
+      upstreamURL: `${mock.url}/v1`,
+      mainModel: "mock-model",
+      trace,
+      workspaceRoot: ws,
+      captureStoreDir: store,
+      artifactRoots: [artifactRoot],
+    });
+    const url = await proxy.start();
+
+    // Turn 1 runs and ends.
+    await postEvent(url, ...spreadIdentity(identity("s1", "m1", "producing turn")));
+    await postEvent(url, "execution.started", { sessionID: "s1" });
+    expect((await post(url, taskBody("producing turn"))).status).toBe(200);
+    await postEvent(url, "execution.ended", { sessionID: "s1" });
+
+    // Turn 2 opens (same session).
+    await postEvent(url, ...spreadIdentity(identity("s1", "m2", "following turn")));
+    await postEvent(url, "execution.started", { sessionID: "s1" });
+    expect((await post(url, taskBody("following turn"))).status).toBe(200);
+
+    // A LATE artifact event references turn 1's producing message.
+    await postEvent(url, "tool.output.artifact", {
+      sessionID: "s1",
+      messageID: "m1",
+      path: artifactFile,
+    });
+    await sleep(300);
+
+    const turn1 = proxy.turns.get("turn-00000001");
+    const turn2 = proxy.turns.get("turn-00000002");
+    expect(turn1?.artifacts?.some((a) => a.originalPath === artifactFile)).toBe(true);
+    expect(turn2?.artifacts?.some((a) => a.originalPath === artifactFile) ?? false).toBe(false);
+
+    await proxy.stop();
+    await mock.stop();
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(store, { recursive: true, force: true });
+    rmSync(artifactRoot, { recursive: true, force: true });
+  });
+
+  it("a request referencing an uncaptured artifact waits for capture, then forwards", async () => {
+    const ws = makeTemp();
+    const store = makeTemp();
+    const trace = new EventTrace();
+    const mock = await startUpstream();
+    const artifactRoot = makeTemp();
+    const artifactFile = join(artifactRoot, "waited.out");
+    writeFileSync(artifactFile, "referenced content");
+    const proxy = new CaptureProxy({
+      upstreamURL: `${mock.url}/v1`,
+      mainModel: "mock-model",
+      trace,
+      workspaceRoot: ws,
+      captureStoreDir: store,
+      artifactRoots: [artifactRoot],
+      artifactDelayMs: 500,
+    });
+    const url = await proxy.start();
+
+    await postEvent(url, ...spreadIdentity(identity("s1", "m1", "waiting turn")));
+    await postEvent(url, "execution.started", { sessionID: "s1" });
+
+    const started = Date.now();
+    const res = await post(
+      url,
+      taskBodyWithMarker("waiting turn", artifactFile),
+    );
+    expect(res.status).toBe(200);
+    const elapsed = Date.now() - started;
+
+    // The request waited out the 500 ms capture delay before forwarding.
+    expect(elapsed).toBeGreaterThanOrEqual(400);
+    const captured = trace.filter("artifact.captured")[0];
+    const forwarded = trace.filter("request.forwarded")[0];
+    expect(captured?.seq).toBeLessThan(forwarded?.seq ?? Number.MAX_SAFE_INTEGER);
+    expect(mock.observations.length).toBe(1);
+    // The artifact is recorded on the turn and its reference persisted.
+    expect(proxy.turns.get("turn-00000001")?.artifacts?.[0]?.originalPath).toBe(artifactFile);
+    const refsFile = join(store, "checkpoints", proxy.turns.get("turn-00000001")?.checkpointId ?? "", "referenced_artifacts.json");
+    expect(existsSync(refsFile)).toBe(true);
+
+    await proxy.stop();
+    await mock.stop();
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(store, { recursive: true, force: true });
+    rmSync(artifactRoot, { recursive: true, force: true });
+  });
+});

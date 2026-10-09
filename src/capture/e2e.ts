@@ -22,6 +22,8 @@ export interface E2EOptions {
    * limit, and force tool-output truncation with huge tool outputs.
    */
   readonly probe?: { readonly compaction?: boolean; readonly truncation?: boolean };
+  /** Test hook: delay each artifact capture (R5 waiting evidence). */
+  readonly artifactDelayMs?: number;
 }
 
 export interface E2EEnv {
@@ -117,7 +119,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
             return { content: "done big" };
           }
           if (options.probe?.compaction === true && lastUserText.includes("FILL")) {
-            return { content: `filler.\n${"y".repeat(200000)}` };
+            return { content: `filler.\n${"y".repeat(300000)}` };
           }
           if (lastUserText.startsWith("You MUST summarize")) {
             // OpenCode validates the compaction summary against its template;
@@ -144,6 +146,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
                 "",
                 "## Important Context",
                 "- Mock model environment; no external services.",
+                "- COMPACTION-SUMMARY-MARKER-424242",
               ].join("\n"),
             };
           }
@@ -181,6 +184,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
       providerBaseURLIsConfiguredAfterStart: true,
     },
     ...(options.failCapture !== undefined ? { failCapture: options.failCapture } : {}),
+    ...(options.artifactDelayMs !== undefined ? { artifactDelayMs: options.artifactDelayMs } : {}),
   });
   const proxyURL = await proxy.start();
 

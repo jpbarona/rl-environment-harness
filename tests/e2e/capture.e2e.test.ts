@@ -332,6 +332,66 @@ describe("real compaction and truncation (OpenCode v2.0.18)", () => {
       });
       expect(r2.code, `opencode run failed. stderr:\n${r2.stderr}`).toBe(0);
 
+      // R4: the accepted summary is captured authoritatively, and the
+      // subsequent turn's effective model request contains the same
+      // summary content OpenCode actually used.
+      const checkpointsDir = join(env.runDir, "capture-store", "checkpoints");
+      const ckptIds = readdirSync(checkpointsDir);
+      const compactionRecords = ckptIds
+        .map((id) => {
+          const file = join(checkpointsDir, id, "compaction.json");
+          if (!existsSync(file)) {
+            return null;
+          }
+          return JSON.parse(readFileSync(file, "utf8")) as {
+            source: string;
+            summaries: Array<{ summary: string }>;
+          };
+        })
+        .filter(
+          (r): r is { source: string; summaries: Array<{ summary: string }> } =>
+            r !== null && !Array.isArray(r) && r.source === "proxy-authoritative" &&
+            Array.isArray(r.summaries) && r.summaries.length > 0,
+        );
+      expect(compactionRecords.length, "expected a proxy-authoritative compaction record").toBeGreaterThan(0);
+      const MARKER = "COMPACTION-SUMMARY-MARKER-424242";
+      const summaryWithMarker = compactionRecords.find((r) =>
+        r.summaries.some((s) => s.summary.includes(MARKER)),
+      );
+      expect(
+        summaryWithMarker,
+        `accepted summary must contain the deterministic marker; records: ${JSON.stringify(compactionRecords.map((r) => r.summaries.map((s) => s.summary.slice(0, 120))))}`,
+      ).toBeDefined();
+
+      // The effective model request of the follow-up turn embeds the same
+      // summary text.
+      const allRequests = ckptIds.flatMap((id) => {
+        const f = join(checkpointsDir, id, "model_requests.jsonl");
+        if (!existsSync(f)) {
+          return [];
+        }
+        return readFileSync(f, "utf8")
+          .trim()
+          .split("\n")
+          .map((l) => JSON.parse(l) as { classification: string; body: { messages: Array<{ role: string; content: unknown }> } });
+      });
+      const summaryInContext = allRequests.some((r) =>
+        JSON.stringify(r.body.messages).includes(MARKER),
+      );
+      expect(
+        summaryInContext,
+        "the follow-up turn's effective model request must contain the accepted compaction summary",
+      ).toBe(true);
+
+      // Later failed-attempt content exclusion: the saved request for the
+      // follow-up turn was persisted before forwarding, so the model's own
+      // response to it cannot be part of the saved starting context.
+      const responseEcho = "ok: and then reply briefly";
+      expect(
+        allRequests.some((r) => JSON.stringify(r.body.messages).includes(responseEcho) && r.classification === "task-new-turn"),
+        "a task-new-turn saved request must not embed the assistant response produced after it",
+      ).toBe(false);
+
       // The hook classified at least one provider call as compaction,
       // authoritatively (x-capture-purpose header, not prompt strings).
       const authoritative = env.trace.filter("classification.authoritative");
@@ -359,6 +419,7 @@ describe("real compaction and truncation (OpenCode v2.0.18)", () => {
       const env = await createE2E({
         name: "truncation",
         probe: { truncation: true, compaction: false },
+        artifactDelayMs: 400,
       });
       cleanups.push(env.cleanup);
 
@@ -397,10 +458,52 @@ describe("real compaction and truncation (OpenCode v2.0.18)", () => {
         refs.some((a) => a.originalPath.includes("/shell/") && a.originalPath.endsWith(".out")),
         `expected a shell-output artifact in ${JSON.stringify(refs)}`,
       ).toBe(true);
+      // R5: the captured artifact content matches the actual full-output file
+      // byte-for-byte (existence alone is insufficient).
+      const { createHash } = await import("node:crypto");
       for (const ref of refs) {
         const objectPath = join(env.runDir, "capture-store", "objects", ref.sha256);
         expect(existsSync(objectPath), `artifact object missing: ${objectPath}`).toBe(true);
+        const actualBytes = readFileSync(ref.originalPath);
+        const savedBytes = readFileSync(objectPath);
+        expect(createHash("sha256").update(actualBytes).digest("hex")).toBe(ref.sha256);
+        expect(createHash("sha256").update(savedBytes).digest("hex")).toBe(ref.sha256);
+        expect(savedBytes.equals(actualBytes)).toBe(true);
       }
+
+      // R5: the dependent round (the request consuming the tool output)
+      // forwarded only after the artifact was captured. The 400 ms capture
+      // delay makes the wait observable.
+      const capturedEv = env.trace.filter("artifact.captured")[0];
+      const dependentForward = env.trace
+        .filter("request.forwarded")
+        .filter((e) => {
+          const rec = env.proxy.requests.find((r) => r.index === e.data["index"]);
+          return rec !== undefined && rec.classification === "task-continuation";
+        })[0];
+      expect(capturedEv, "artifact.captured must exist").toBeDefined();
+      expect(dependentForward, "a dependent (continuation) forward must exist").toBeDefined();
+      expect(capturedEv?.seq).toBeLessThan(dependentForward?.seq ?? Number.MAX_SAFE_INTEGER);
+      expect(Date.parse(dependentForward?.ts ?? "")).toBeGreaterThanOrEqual(
+        Date.parse(capturedEv?.ts ?? "") - 5,
+      );
+
+      // R5: a later user turn's starting record contains the artifact
+      // reference (the plugin carries accumulated references forward).
+      const r2 = await env.runPrompt("one more turn please", { continueLast: true });
+      expect(r2.code, `opencode run failed. stderr:\n${r2.stderr}`).toBe(0);
+      const ckptDirs = readdirSync(checkpointsDir);
+      const nextTurnRefs = ckptDirs
+        .filter((id) => id !== ckpt)
+        .map((id) => join(checkpointsDir, id, "referenced_artifacts.json"))
+        .filter((f) => existsSync(f))
+        .map((f) => JSON.parse(readFileSync(f, "utf8")) as Array<{ originalPath: string }>);
+      expect(
+        nextTurnRefs.some((list) =>
+          list.some((a) => a.originalPath === refs[0]?.originalPath),
+        ),
+        `the follow-up turn must reference the artifact; got ${JSON.stringify(nextTurnRefs)}`,
+      ).toBe(true);
 
       // No unsupported-state failures: the capture report lists the
       // artifacts as saved, not unsupported.

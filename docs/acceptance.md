@@ -1,5 +1,7 @@
 # Acceptance contract
 
+**Step 2 authority:** [Frozen Step 2 requirements](step-2-requirements.md) define the current finish line and supersede conflicting Step 2 wording below. Later-step checks remain separate.
+
 The checks below mirror the deterministic-check table in the MVP
 design draft and make the user-turn boundary exact. Each check has a
 pass condition; a check that cannot run is a failure of that step's

@@ -30,6 +30,7 @@ export const CAPTURE_PLUGIN_SOURCE = `export default {
     }
     const identities = new Map()
     const referencedToolOutputFiles = []
+    const artifactByCall = new Map()
     const collectTruncation = (messages) => {
       const unsupported = []
       const referenced = []
@@ -38,12 +39,20 @@ export const CAPTURE_PLUGIN_SOURCE = `export default {
           if (part.type !== "tool") continue
           const meta = part.state?.metadata ?? {}
           if (meta.truncated !== true) continue
-          // OpenCode truncation writes the full output to a file and marks
-          // the inline tail with: "full output saved to <path>".
           const output = typeof part.state?.output === "string" ? part.state.output : ""
-          const match = /full output saved to (.+)\\s*$/.exec(output)
+          const rawContent = part.state?.content
+          const contentText = typeof rawContent === "string"
+            ? rawContent
+            : Array.isArray(rawContent)
+              ? rawContent.map(p => (p && typeof p === "object" && typeof p.text === "string") ? p.text : "").join("\\n")
+              : ""
+          const marker = /full output saved to ([^[\\]]+?)\\s*\\]?\\s*$/
+          const match = marker.exec(output) ?? marker.exec(contentText)
+          const known = part.id !== undefined ? artifactByCall.get(part.id) : undefined
           if (match !== null) {
             referenced.push(match[1].trim())
+          } else if (known !== undefined) {
+            referenced.push(known)
           } else if (typeof meta.truncatedOutputPath === "string" && meta.truncatedOutputPath.length > 0) {
             referenced.push(meta.truncatedOutputPath)
           } else {
@@ -140,7 +149,10 @@ export const CAPTURE_PLUGIN_SOURCE = `export default {
             const artifactPath = match[1].trim()
             if (!referencedToolOutputFiles.includes(artifactPath)) {
               referencedToolOutputFiles.push(artifactPath)
-              send("tool.output.artifact", { sessionID: d.sessionID, path: artifactPath })
+              if (typeof d.id === "string") {
+                artifactByCall.set(d.id, artifactPath)
+              }
+              send("tool.output.artifact", { sessionID: d.sessionID, messageID: identities.get(d.sessionID) ?? null, path: artifactPath })
             }
           }
         } else if (type === "message.updated") {

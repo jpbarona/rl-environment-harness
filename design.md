@@ -22,7 +22,7 @@ A captured attempt is not a validated RL task. Each task requires a success chec
 - Keep the main document brief. Put detailed research, debugging, and test evidence in the agent log.
 - Revise this document as decisions change. Do not rewrite the agent log.
 
-**Current phase:** Review and refine this MVP design draft. Implementation has not started.
+**Current phase:** Complete Step 2 against the [frozen acceptance requirements](docs/step-2-requirements.md). Implementation is underway. No new acceptance conditions may be added without user approval.
 
 ## Capture and daily use
 

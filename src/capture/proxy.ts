@@ -40,6 +40,8 @@ export interface TurnRecord {
   contextSaved: boolean;
   /** Referenced tool-output artifacts captured for this turn. */
   artifacts?: Array<{ originalPath: string; sha256: string }>;
+  /** Artifact captures in flight; dependent requests wait for zero. */
+  artifactsPending: number;
   /** Authoritative state supplied by the integration, not inferred from prose. */
   requiredState?: RequiredTurnState;
 }
@@ -87,7 +89,9 @@ export interface CaptureProxyOptions {
    */
   readonly identityTimeoutMs?: number;
   /** Maximum capture attempts per turn before requests are blocked. Default 3. */
-  readonly maxCaptureAttempts?: number; // Deprecated: failed turns never retry capture.
+  readonly maxCaptureAttempts?: number;
+  /** Test hook: delay each artifact capture to prove dependent actions wait. */
+  readonly artifactDelayMs?: number;
   /**
    * Runtime/configuration references persisted with every checkpoint.
    * Example: { opencodeVersion, configPath, isolatedHome, providerBaseURL }.
@@ -277,11 +281,18 @@ export class CaptureProxy {
       this.#closeWindow();
     } else if (parsed.type === "tool.output.artifact") {
       // Truncation artifacts are discovered mid-execution, after the
-      // turn's context was saved; capture them into the open turn. The
-      // file may not be flushed yet — wait bounded, then fail closed.
-      const d = (parsed.data ?? {}) as { sessionID?: unknown; path?: unknown };
-      const turnId =
-        typeof d.sessionID === "string" ? this.#lastTurnBySession.get(d.sessionID) : undefined;
+      // turn's context was saved; capture them into the producing turn.
+      // The event carries the producing user-message ID; late events bind
+      // to that exact turn, never to whichever turn happens to be open.
+      // The file may not be flushed yet — wait bounded, then fail closed.
+      const d = (parsed.data ?? {}) as { sessionID?: unknown; messageID?: unknown; path?: unknown };
+      let turnId: string | undefined;
+      if (typeof d.sessionID === "string" && typeof d.messageID === "string") {
+        turnId = this.#identityToTurn.get(key(d.sessionID, d.messageID));
+      }
+      if (turnId === undefined && typeof d.sessionID === "string") {
+        turnId = this.#lastTurnBySession.get(d.sessionID);
+      }
       const turn = turnId !== undefined ? this.turns.get(turnId) : undefined;
       if (turn !== undefined && typeof d.path === "string") {
         void this.#captureArtifactWithWait(turn, d.path).catch((err: unknown) => {
@@ -292,31 +303,47 @@ export class CaptureProxy {
           });
           this.#sealFailure(turn, err instanceof Error ? err : new Error(String(err)));
         });
+      } else {
+        this.#options.trace.append("artifact.unattributed", {
+          sessionID: d.sessionID,
+          messageID: d.messageID,
+          path: d.path,
+        });
       }
     }
   }
 
   /** Capture an artifact, waiting bounded for its file to appear. */
   async #captureArtifactWithWait(turn: TurnRecord, path: string): Promise<void> {
-    const attempts = 8;
-    const waitMs = 250;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      try {
-        this.#captureArtifact(turn, path);
-        if (turn.contextSaved && turn.checkpointId !== null) {
-          this.#writeReferencedArtifacts(
-            turn,
-            join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId),
-          );
-        }
-        return;
-      } catch (err) {
-        const missing = err instanceof Error && "code" in err && (err as { code?: unknown }).code === "ENOENT";
-        if (!missing || attempt === attempts) {
-          throw err;
-        }
-        await delay(waitMs);
+    turn.artifactsPending += 1;
+    try {
+      // Test hook: delay capture to prove dependent actions wait.
+      if ((this.#options.artifactDelayMs ?? 0) > 0) {
+        await delay(this.#options.artifactDelayMs ?? 0);
       }
+      const attempts = 8;
+      const waitMs = 250;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+          this.#captureArtifact(turn, path);
+          if (turn.contextSaved && turn.checkpointId !== null) {
+            this.#writeReferencedArtifacts(
+              turn,
+              join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId),
+            );
+          }
+          return;
+        } catch (err) {
+          const missing = err instanceof Error && "code" in err && (err as { code?: unknown }).code === "ENOENT";
+          if (!missing || attempt === attempts) {
+            throw err;
+          }
+          await delay(waitMs);
+        }
+      }
+      throw new Error("artifact capture did not complete");
+    } finally {
+      turn.artifactsPending -= 1;
     }
   }
 
@@ -389,6 +416,7 @@ export class CaptureProxy {
       captureState: "capturing",
       captureAttempts: 0,
       contextSaved: false,
+      artifactsPending: 0,
       ...(requiredState ? { requiredState } : {}),
     };
     this.turns.set(turnId, turn);
@@ -587,6 +615,35 @@ export class CaptureProxy {
       }
       trace.append(purpose === undefined ? "classification.provisional" : "classification.authoritative", {
         index: recorded.index, basis: backgroundClassification });
+      // R4: record the actual compaction request and the summary response
+      // OpenCode accepted, inside the turn whose execution produced them.
+      // The call may arrive without a held binding; resolve the turn from
+      // the authoritative session header.
+      const isCompaction = backgroundClassification === "background-compaction";
+      if (isCompaction) {
+        const compactionTurn =
+          bound !== null
+            ? turn
+            : typeof requestSession === "string"
+              ? this.#resolveTurnForSession(requestSession)
+              : undefined;
+        if (compactionTurn !== undefined) {
+          try {
+            this.#appendCompactionRequest(compactionTurn.id, body);
+          } catch (err) {
+            this.#sealFailure(compactionTurn, err);
+            this.#blockRequest(model, path, "compaction-record-failed");
+          }
+          await this.#forward(req, res, body, auth, recorded, (responseText, status) => {
+            this.#recordCompactionSummary(compactionTurn.id, responseText, status);
+          });
+          return;
+        }
+        trace.append("compaction.record.skipped", {
+          reason: "no identified turn for session",
+          sessionID: requestSession,
+        });
+      }
       await this.#forward(req, res, body, auth, recorded);
       return;
     }
@@ -598,6 +655,17 @@ export class CaptureProxy {
     } catch (err) {
       this.#sealFailure(turn, err);
       this.#blockRequest(model, path, "context-persistence-failed");
+    }
+
+    // R5 barrier: required tool-output artifacts must be captured before
+    // any dependent model action consumes them. Wait for event-driven
+    // captures to settle and capture any artifact this request itself
+    // references. Failure seals the turn.
+    try {
+      await this.#settleTurnArtifacts(turn, body);
+    } catch (err) {
+      this.#sealFailure(turn, err);
+      this.#blockRequest(model, path, "artifact-persistence-failed");
     }
 
     const classification = turn.requestCount === 0 ? "task-new-turn" : "task-continuation";
@@ -629,6 +697,93 @@ export class CaptureProxy {
     }
     turn.requestCount += 1;
     await this.#forward(req, res, body, auth, recorded);
+  }
+
+  /**
+ * Wait for in-flight artifact captures to settle and capture any
+ * truncated-output artifact this request references directly. Bounded by
+ * the identity timeout; failure seals the turn.
+ */
+  async #settleTurnArtifacts(turn: TurnRecord, body: string): Promise<void> {
+    const paths = new Set<string>();
+    for (const match of body.matchAll(/full output saved to ([^\\\]\s"]+)/g)) {
+      const p = match[1];
+      if (p !== undefined) {
+        paths.add(p);
+      }
+    }
+    for (const p of paths) {
+      if (turn.artifacts?.some(a => a.originalPath === p)) {
+        continue;
+      }
+      await this.#captureArtifactWithWait(turn, p);
+    }
+    const deadline = Date.now() + (this.#options.identityTimeoutMs ?? 10_000);
+    while (turn.artifactsPending > 0 && Date.now() < deadline) {
+      await delay(50);
+    }
+    if (turn.artifactsPending > 0) {
+      throw new Error("artifact capture did not settle within the identity timeout");
+    }
+    if (paths.size > 0 && turn.checkpointId !== null) {
+      this.#writeReferencedArtifacts(
+        turn,
+        join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId),
+      );
+    }
+  }
+
+  /** The turn currently or most recently executing for a session. */
+  #resolveTurnForSession(sessionId: string): TurnRecord | undefined {
+    if (this.#window !== null && this.#window.sessionId === sessionId) {
+      return this.turns.get(this.#window.turnId);
+    }
+    const turnId = this.#lastTurnBySession.get(sessionId);
+    return turnId !== undefined ? this.turns.get(turnId) : undefined;
+  }
+
+  /** Append one compaction request body to the turn's checkpoint. */
+  #appendCompactionRequest(turnId: string, body: string): void {
+    const turn = this.turns.get(turnId);
+    if (turn === undefined || turn.checkpointId === null) {
+      throw new Error(`compaction request cannot be recorded: no checkpoint for turn ${turnId}`);
+    }
+    const dir = join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId);
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(
+      join(dir, "compaction_requests.jsonl"),
+      `${JSON.stringify({ at: new Date().toISOString(), body: JSON.parse(body) })}\n`,
+    );
+  }
+
+  /** Record the compaction summary response OpenCode accepted. */
+  #recordCompactionSummary(turnId: string, responseText: string, status: number): void {
+    const turn = this.turns.get(turnId);
+    if (turn === undefined || turn.checkpointId === null) {
+      return;
+    }
+    const dir = join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId);
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "compaction.json");
+    let record: { source: string; summaries: Array<{ at: string; status: number; summary: string }> } = {
+      source: "proxy-authoritative",
+      summaries: [],
+    };
+    try {
+      const existing = JSON.parse(readFileSync(file, "utf8")) as typeof record;
+      if (existing.source === "proxy-authoritative" && Array.isArray(existing.summaries)) {
+        record = existing;
+      }
+    } catch {
+      // No prior authoritative record; start one.
+    }
+    record.summaries.push({ at: new Date().toISOString(), status, summary: responseText });
+    writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+    this.#options.trace.append("compaction.summary.recorded", {
+      turnId,
+      status,
+      bytes: responseText.length,
+    });
   }
 
   /** Capture one referenced artifact into the shared object store. */
@@ -887,7 +1042,25 @@ export class CaptureProxy {
     }
     if (required !== undefined) {
       writeFileSync(join(dir, "session_state.json"), `${JSON.stringify(required.priorSessionState ?? null)}\n`);
-      writeFileSync(join(dir, "compaction.json"), `${JSON.stringify(required.compaction ?? null)}\n`);
+      // Compaction record: preserve an authoritative recorder-written record
+      // (from actual compaction calls) and attach hook-declared metadata;
+      // otherwise record the hook-declared compaction state as-is.
+      const compactionFile = join(dir, "compaction.json");
+      let authoritative: { source?: string; hookDeclared?: unknown } | null = null;
+      try {
+        const existing = JSON.parse(readFileSync(compactionFile, "utf8")) as { source?: string };
+        if (existing !== null && typeof existing === "object" && existing.source === "proxy-authoritative") {
+          authoritative = existing as { source?: string; hookDeclared?: unknown };
+        }
+      } catch {
+        // No existing record.
+      }
+      if (authoritative !== null) {
+        authoritative.hookDeclared = required.compaction ?? null;
+        writeFileSync(compactionFile, `${JSON.stringify(authoritative, null, 2)}\n`);
+      } else {
+        writeFileSync(compactionFile, `${JSON.stringify(required.compaction ?? null)}\n`);
+      }
       for (const path of required.referencedToolOutputFiles ?? []) {
         this.#captureArtifact(turn, path);
       }
@@ -958,6 +1131,7 @@ export class CaptureProxy {
     body: string,
     auth: string | undefined,
     recorded: RecordedRequest,
+    onResponse?: (responseText: string, status: number) => void,
   ): Promise<void> {
     const trace = this.#options.trace;
     const up = new URL(this.#options.upstreamURL);
@@ -1028,6 +1202,9 @@ export class CaptureProxy {
       return;
     }
     const responseText = await readBody(response);
+    if (onResponse !== undefined) {
+      onResponse(responseText, response.statusCode ?? 0);
+    }
     const index = this.requests.indexOf(recorded);
     const upstreamStatus = response.statusCode;
     this.requests[index] = {

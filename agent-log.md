@@ -454,3 +454,48 @@ Earlier fixture iterations failed and were corrected: request text arrived with 
 ### Step 2 status
 
 **DONE.** All three remaining items are implemented and verified against real OpenCode v2.0.18. No known blockers remain for starting Step 3.
+
+## Entry — Frozen Step 2 acceptance baseline
+
+**Author:** Codex, primary agent. **Date:** 2026-10-09, America/New_York; exact time not recorded. [Citation: client time context.]
+
+**User requirement:** Document a clear goal and complete requirement set so implementation and review converge on a fixed finish line. [Citation: user request “document the set of requirements … i want a goal that we work towards”, and preceding exchange freezing six requirements.]
+
+**Verified observation:** Created `docs/step-2-requirements.md` with R1–R6, evidence scenarios, scope limits, change-control rules, and a completion gate. Added authority links to design.md and docs/acceptance.md. Existing log entries were not modified. [Citation: file-write operations in this turn; the named files.]
+
+**Normative decision:** Only demonstrated violations of R1–R6 block Step 2. New acceptance requirements require explicit user approval. Container replay, packaging, reward validation, and unrelated improvements do not expand this gate. [Citation: docs/step-2-requirements.md, “Authority and change control” and “Completion rule”; the preceding agreed six-requirement baseline.]
+
+**Next action:** implement and verify the remaining R4/R5 conditions, run affected regressions and final suite, and append a per-requirement acceptance result table. Passing test counts alone do not establish completion. [Citation: docs/step-2-requirements.md, current review focus and completion rule.]
+
+## Entry 013 — Step 2 acceptance gate: R1–R6 result table
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent.  
+**Date:** 2026-10-09, late afternoon, America/New_York.  
+**Revision reviewed:** commit `385d4c9` working tree (R4/R5 completion changes, uncommitted at review time).  
+**Frozen baseline:** `docs/step-2-requirements.md`.
+
+### Commands run (final verification)
+
+1. `npm run typecheck` — exit 0 (strictest TypeScript flags).
+2. `npm run test` — 38 passed, 0 failed (vitest, unit + proxy-level integration).
+3. `npx vitest run tests/e2e` — 5 passed, 0 failed, run twice back-to-back (second run: 5 passed). Real OpenCode v2.0.18 integration.
+
+### R1–R6 result table
+
+| Req | Result | Evidence (tests and artifacts) |
+|---|---|---|
+| R1 — Distinct, explicit turn identity | **PASS** | Unit: `repeated identical prompts in separate executions get distinct turns and checkpoints` (identical text → distinct message ids `m1`/`m2`, distinct `ckpt-*`); `holds a request with no identity, releases it when the identity event arrives` (no text fallback); `fails with a clear error when identity never arrives` (503 `identity-unresolved`, no upstream execution). E2E: both chained turns bound to distinct `msg_*` ids (`work/e2e/ordered-capture-*/trace.jsonl`). |
+| R2 — Saving precedes execution; sealed failures | **PASS** | Real OpenCode awaited admission/tool gates (plugin `/capture-gate`, `/tool-gate`; trace events `tool.gate.allowed`, `admission-capture-failed`). Delayed capture: unit `holds requests arriving before identity and capture` uses a 600 ms capture delay and asserts `capture.committed` seq < first forward seq and mock arrival timestamp after commit. Injected failures: `capture failure blocks the turn; retries are bounded then exhausted`, context-write and request-write failure paths seal (`context-persistence-failed`, `request-persistence-failed`), missing/outside-roots artifacts seal (see R5). New-turn recovery: every e2e chained-turn test starts a fresh checkpoint after prior windows. |
+| R3 — Correct starting files and supplied context | **PASS** | E2E `captures the actual first-turn file changes before the selected second attempt` (real two-turn fixture: tracked edit, untracked file, ignored file, deletion, symlink, executable bit; saved contents vs. actual pre-turn state). Unit: `snapshotWorkspace` captures modes/symlinks/hashes; `checkpoints share one content store; unchanged files are stored once` (shared object reuse); `captures prior context, model requests, tool outputs, and runtime refs per checkpoint` (prior context excludes the final user message and its response suffix; first effective request persisted pre-forward in `model_requests.jsonl`). |
+| R4 — Compacted context captured correctly | **PASS** | E2E `compaction: OpenCode compacts a full context and the hook identifies the compaction calls authoritatively` plus new assertions: real OpenCode compaction triggered (200,000+ char filler; `limit: {context: 100000}` with `reserved: 60000`); recorder persists the actual compaction request (`compaction_requests.jsonl`) and the summary response OpenCode accepted (`compaction.json`, `source: proxy-authoritative`) inside the follow-up turn's checkpoint; the accepted summary contains the deterministic marker `COMPACTION-SUMMARY-MARKER-424242` and the SAME marker appears in the follow-up turn's saved effective model request (`model_requests.jsonl`) — saved summary equals supplied context. The follow-up turn's saved request excludes its own later response content. Evidence: `work/e2e/compaction-1791578343776-4z5xc4/capture-store/checkpoints/ckpt-00231548f71e/{compaction.json,model_requests.jsonl}`. Compaction purpose is authoritative via `x-capture-purpose` (`classification.authoritative`, basis `background-compaction`), not model-name or prompt-string guessing. |
+| R5 — Referenced tool-output files saved before dependent execution | **PASS** | E2E `truncation: truncated shell output is captured as a referenced artifact from its saved-file path` with real OpenCode: shell tool produced 80,000 chars; OpenCode truncated inline and saved the full output to `home/data/opencode/shell/<hash>/<id>.out` (marker `full output saved to <path>`); plugin extracts the path (`session.tool.success` → `tool.output.artifact` with the producing user-message ID); proxy stores content in the shared object store and writes `referenced_artifacts.json`. Assertions: captured object bytes and sha256 EQUAL the actual full-output file (byte-for-byte, not existence); the dependent round (task-continuation request consuming the tool output) forwarded only after `artifact.captured` (seq ordering + timestamps, with a 400 ms `artifactDelayMs` making the wait observable); a later user turn's starting record references the same artifact. Failure handling: unit tests `a missing required artifact seals the turn`, `an artifact outside allowed roots seals the turn` (bounded 8×250 ms retry, then `artifact.capture.failed` + sealed turn + 502, no upstream execution, repair-too-late stays blocked); `a late artifact event binds to its producing turn, not the open one`; `a request referencing an uncaptured artifact waits for capture, then forwards`. Evidence: `work/e2e/truncation-1791578345398-skcrrt/`. |
+| R6 — Reusable integration and secure forwarding | **PASS** | All e2e fixtures install the REUSABLE plugin source via `writeCapturePlugin` (`src/capture/plugin.ts`); `tests/plugin-source.test.ts` imports the generated module and asserts the default export shape. HTTPS: unit `preserves upstream protocol, host, and base path (https routing)` (self-signed endpoint; actual scheme `/api/v1/chat/completions` path and Authorization observed at the upstream). Destination escape: `rejects absolute URLs, protocol-relative URLs, and unsupported endpoint paths` (400, nothing upstream, no `auth.forwarded`); `never sends credentials to a non-loopback http upstream`. Credential scan: `forwards Authorization upstream in memory and never persists it` scans the trace file, all capture-store files, and in-memory events for the token. Purpose/session metadata: authoritative hook headers distinguish task/title/compaction (`classification.authoritative` events); small-model and title-prompt fallback classifications are tagged `classification.provisional`. |
+
+### Notes
+
+- Preserved prior evidence: all tests from commits `1a1fed1`, `3a2176e`, `385d4c9` still pass (38 unit + 5 integration include them).
+- Fixed during this review: the plugin's truncation scan now reads `state.content` (OpenCode v2.0.18 stores truncated output there, not `state.output`) with a call-ID fallback map; template-literal escaping corruption in the plugin regexes is guarded by the module-load test; compaction.json preserves authoritative recorder records and attaches hook-declared metadata without clobbering.
+
+### Step 2 completion
+
+All six requirements have passing evidence at the current revision; type checking, unit tests, and required real OpenCode integration tests pass; this entry records the revision, command results, and evidence paths. **Step 2 is COMPLETE.** Stopping here per the gate; Step 3 not started.
