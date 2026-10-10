@@ -14,8 +14,9 @@
  * failed check named and every check that could not run marked explicitly.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { writeRestoreResult } from "./report.js";
 import { fileURLToPath } from "node:url";
 
 interface Args {
@@ -27,29 +28,6 @@ interface Args {
   readonly timeoutMs?: number | undefined;
   readonly mutateAfterCompare?: boolean;
 }
-
-/** Every check the worker would perform, in execution order, plus the
- * CLI-level checks that can fail before or around the worker. */
-const WORKER_CHECKS = [
-  "selection.identity",
-  "objects.verified",
-  "workspace.materialized",
-  "workspace.tree",
-  "workspace.git-init",
-  "workspace.config-rebind",
-  "artifacts.materialized",
-  "session.db-init",
-  "session.seeded",
-  "request.interception",
-  "request.comparison",
-  "outbound.inference-count",
-  "runtime.docker",
-  "runtime.image-build",
-  "selection.store-missing",
-  "selection.checkpoint-missing",
-  "worker.run",
-  "cli.unexpected",
-] as const;
 
 function parseArgs(argv: readonly string[]): Args {
   const get = (flag: string): string | undefined => {
@@ -89,29 +67,11 @@ function writeFailureReport(
   detail: string,
 ): void {
   try {
-    mkdirSync(args.output, { recursive: true });
-  } catch {
-    // The output path itself is unusable; nothing more can be retained.
-  }
-  const checks = WORKER_CHECKS.map((name) =>
-    name === failedCheck
-      ? { check: name, ok: false, detail: `FAILED — ${detail}` }
-      : { check: name, ok: false, detail: "not run: the run failed before this check" },
-  );
-  try {
-    writeFileSync(
-      join(args.output, "result.json"),
-      `${JSON.stringify({
-        status,
-        checkpoint: args.checkpoint,
-        runStarted: new Date().toISOString(),
-        store: args.store,
-        checks,
-        result: detail,
-      }, null, 2)}\n`,
-    );
-  } catch {
-    // Best effort: the failure is also printed to stderr below.
+    writeRestoreResult(args.output, status, args.checkpoint, Date.now(), [
+      { check: failedCheck, ok: false, detail: `FAILED — ${detail}` },
+    ], { store: args.store, result: detail });
+  } catch (error) {
+    console.error(`Cannot save failure evidence: ${String(error)}`);
   }
   console.error(`RESTORE ${status}: failed check=${failedCheck} — ${detail}`);
   console.error(`Report: ${join(args.output, "result.json")}`);

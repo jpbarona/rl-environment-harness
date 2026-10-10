@@ -133,7 +133,17 @@ export function selectCheckpoint(input: SelectionInput): RestoreSelection {
     throw new RestoreError("selection.runtime-incomplete", "runtime.json lacks workspace root or OpenCode version");
   }
 
+  if (manifest.checkpointId !== checkpointId || manifest.root !== runtime.workspaceRoot) {
+    throw new RestoreError("selection.identity-conflict", "manifest checkpoint/workspace conflicts with runtime");
+  }
+  const session = readJson<{ session?: { id?: unknown } } | null>(join(dir, "session_state.json"), "session_state.json");
+  if (session !== null && (typeof session !== "object" || session.session?.id !== runtime.sessionId)) {
+    throw new RestoreError("selection.identity-conflict", "session state conflicts with runtime session");
+  }
   const prior = readJson<PriorContextRecord>(join(dir, "prior_context.json"), "prior_context.json");
+  if (typeof runtime.turnId !== "string" || prior.turnId !== runtime.turnId) {
+    throw new RestoreError("selection.identity-conflict", "prior context turn conflicts with runtime turn");
+  }
   if (!Array.isArray(prior.priorMessages)) {
     throw new RestoreError("selection.context-missing", "prior_context.json lacks priorMessages");
   }

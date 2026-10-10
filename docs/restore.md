@@ -49,7 +49,7 @@ Recorded in `containers/restore/lock.json` and baked into the image:
 
 ## Request comparison policy (S3-R4)
 
-Everything is compared exactly: model id, ordered messages and their content, tool schemas, and request settings (`stream`, `stream_options`, `store`, `temperature`, `top_p`, `tool_choice`). Three volatile regions are declared and transformed before comparison; anything else fails:
+Everything is compared exactly: model id, ordered messages and their content, tool schemas, and request settings (`stream`, `stream_options`, `store`, `temperature`, `top_p`, `tool_choice`). Four volatile regions are declared and transformed before comparison; anything else fails:
 
 | Field | Reason | Scope |
 |---|---|---|
@@ -62,10 +62,17 @@ Other declared non-comparisons: OpenCode-internal session fields (message ids, t
 
 ## Failure semantics (S3-R6, S3-R7)
 
-Validation happens before execution. The run stops — with a named check in `result.json` and exit code 1 — on: missing or corrupt records/objects (`objects.missing`, `objects.corrupt`, `selection.*`), unsafe filesystem state (`materialize.*`), workspace tree mismatch (`workspace.tree`), session store initialization failure (`session.db-init`), seeding failure (`session.seed`, `seed.compaction-source`), interception timeout (`request.interception`), or request mismatch (`request.comparison`). There is no fallback to a guessed session, no partial replay, and no provider forwarding. Each run owns one container that is removed on exit; evidence under `work/restore/<run-id>` is retained.
+Validation happens before execution. The run stops — with a named check in `result.json` and exit code 1 — on: missing or corrupt records/objects (`objects.missing`, `objects.corrupt`, `selection.*`), unsafe filesystem state (`materialize.*`), workspace tree mismatch (`workspace.tree`), session store initialization failure (`session.db-init`), seeding failure (`session.seeded`, `seed.compaction-source`), interception timeout (`request.interception`), or request mismatch (`request.comparison`). There is no fallback to a guessed session, no partial replay, and no provider forwarding. Each run owns one container that is removed on exit; evidence under `work/restore/<run-id>` is retained.
 
 The CLI reports every failure path in `result.json` as well: docker unavailable (`runtime.docker`, status `BLOCKED`), missing store or checkpoint (`selection.store-missing`, `selection.checkpoint-missing`), image build failure (`runtime.image-build`), and a worker that exits without a report (`worker.run`). The failed check carries the detail and every check that could not run is marked `not run`; a PASS is never claimed on a failure path.
 
 ## Repeated restoration (S3-R5)
 
 The same checkpoint can be restored repeatedly into fresh containers and isolated session stores. The store is read-only to the worker, so a mutation inside restore A cannot change the stored objects, restore B, or the original capture.
+## Failure report completion and import bounds
+
+The CLI and worker use the same report writer. Failed runs retain completed checks, name the failure, and mark remaining checks `not run`. All required report paths exist. Evidence that could not be produced uses a JSON placeholder with `status: unavailable`; no provider request is invented. `result.json` contains relative evidence references.
+
+Session database queries and imports use the configured `--timeout-ms` bound and kill a timed-out child. A failed query has no fallback identity. Unexpected worker errors retain the check history, and worker exit closes its interception proxy. Preflight requires parseable session state and consistent manifest, runtime, prior-context turn, and available session identity.
+
+The first system message's fields other than content are compared exactly. Runtime transforms remain separate: platform text only in the first system message, shell-runtime text only in the shell tool description.

@@ -12,6 +12,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { runSessionCommand } from "./session-command.js";
+import { writeRestoreResult } from "./report.js";
 import { RestoreError, verifyObject } from "./select.js";
 import { EventTrace } from "../capture/trace.js";
 import { CaptureProxy } from "../capture/proxy.js";
@@ -58,10 +60,7 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   const checks: CheckResult[] = [];
   const trace = new EventTrace(join(options.outputDir, "trace.jsonl"));
   const result = (status: "PASS" | "FAIL" | "BLOCKED", extra: Record<string, unknown> = {}): number => {
-    writeFileSync(
-      join(options.outputDir, "result.json"),
-      `${JSON.stringify({ status, checkpoint: options.checkpointId, runStarted: new Date(started).toISOString(), checks, ...extra }, null, 2)}\n`,
-    );
+    writeRestoreResult(options.outputDir, status, options.checkpointId, started, checks, extra);
     console.log(`RESTORE ${status}: checkpoint=${options.checkpointId} run=${options.outputDir}`);
     return status === "PASS" ? 0 : 1;
   };
@@ -70,13 +69,15 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     console.log(`  ${ok ? "ok" : "FAIL"} ${check}${detail ? ` — ${detail}` : ""}`);
   };
 
+  let activeProxy: CaptureProxy | undefined;
+  try {
   // S3-R1: explicit selection and preflight validation.
   let selection;
   try {
     selection = selectCheckpoint({ storeRoot: options.storeRoot, checkpointId: options.checkpointId });
     record("selection.identity", true, `session=${selection.sessionId} message=${selection.messageId}`);
   } catch (err) {
-    record("selection.preflight", false, String(err instanceof Error ? err.message : err));
+    record(err instanceof RestoreError ? err.check : "selection.preflight", false, String(err instanceof Error ? err.message : err));
     return result("FAIL");
   }
   writeFileSync(
@@ -114,6 +115,8 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   }
 
 
+
+  record("workspace.git-init", true, "private git repository initialized");
 
   // S3-R4: materialize referenced tool-output artifacts at their mapped
   // paths. The capture recorded each artifact's absolute path (inside the
@@ -238,6 +241,7 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
       }
     },
   });
+  activeProxy = proxy;
   const proxyURL = await proxy.start();
   const proxyPort = new URL(proxyURL).port;
 
@@ -340,9 +344,16 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     return result("FAIL");
   }
 
+  record("session.db-init", true, "fresh OpenCode store initialized");
+
   // Use the project row OpenCode itself created for this directory; fall
   // back to a deterministic id only when OpenCode has not created one.
-  const projectQuery = spawnSync("sqlite3", [dbPath, "SELECT id FROM project"], { encoding: "utf8" });
+  const projectQuery = runSessionCommand("sqlite3", [dbPath, "SELECT id FROM project"], options.timeoutMs);
+  if (projectQuery.status !== 0) {
+    record("session.project-query", false, String(projectQuery.error ?? projectQuery.stderr));
+    return result("FAIL");
+  }
+  record("session.project-query", true, "project identity queried");
   const openCodeProjectId = (projectQuery.stdout ?? "").trim().split("\n").filter((line) => line.trim() !== "")[0];
   const projectId = openCodeProjectId !== undefined && openCodeProjectId !== "" ? openCodeProjectId : createHash("sha1").update(options.workspacePath).digest("hex");
 
@@ -358,9 +369,9 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   });
   const sqlPath = join(options.outputDir, "seed.sql");
   writeFileSync(sqlPath, renderSeedSql(seedPlan));
-  const seedRun = spawnSync("sqlite3", [dbPath], { input: readFileSync(sqlPath, "utf8"), encoding: "utf8" });
+  const seedRun = runSessionCommand("sqlite3", [dbPath], options.timeoutMs, readFileSync(sqlPath, "utf8"));
   if (seedRun.status !== 0) {
-    record("session.seed", false, String(seedRun.stderr).slice(0, 300));
+    record("session.seeded", false, String(seedRun.error ?? seedRun.stderr).slice(0, 300));
     return result("FAIL");
   }
   record("session.seeded", true, `${seedPlan.rows.length} rows; session=${capturedSessionId}`);
@@ -385,7 +396,6 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   if (intercepted === false) {
     child.kill("SIGKILL");
     copyOpenCodeLogs(xdgData, options.outputDir);
-    await proxy.stop();
     record("request.interception", false, `timeout after ${options.timeoutMs} ms; stderr: ${openCodeStderr.slice(-2000)}`);
     return result("FAIL");
   }
@@ -456,6 +466,13 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     }
   }
   return result(checks.every((c) => c.ok) ? "PASS" : "FAIL");
+  } catch (error) {
+    record(error instanceof RestoreError ? error.check : "worker.unexpected", false,
+      String(error instanceof Error ? error.message : error));
+    return result("FAIL");
+  } finally {
+    await activeProxy?.stop();
+  }
 }
 
 function openCodeEnv(

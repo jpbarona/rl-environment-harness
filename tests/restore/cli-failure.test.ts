@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -23,8 +23,8 @@ beforeAll(() => {
   mkdirSync(join(fakeStore, "checkpoints", "ckpt-fake"), { recursive: true });
   mkdirSync(join(fakeStore, "objects"), { recursive: true });
   writeFileSync(join(fakeStore, "checkpoints", "ckpt-fake", "manifest.json"), JSON.stringify({ root: "/x", checkpointId: "ckpt-fake", files: [] }));
-  // The CLI runs from dist; build it if absent.
-  if (!existsSync(cli)) {
+  // Always test the current source build, never stale compiled code.
+  {
     const build = spawnSync("npm", ["run", "-s", "build"], { encoding: "utf8", cwd: repoRoot });
     expect(build.status, build.stderr).toBe(0);
   }
@@ -95,20 +95,28 @@ describe("S3-R7 CLI failure reports", () => {
     expectFailureShape(outcome, "selection.checkpoint-missing", "does not exist");
   });
 
-  it("reports FAIL with worker.run when the container exits without a report", () => {
-    // The output path is an existing FILE: the evidence mount cannot be
-    // created, so the container exits nonzero without writing a report.
-    const out = join(scratch, "out-file");
-    writeFileSync(out, "not a directory");
-    const outcome = runCli(out, ["--store", fakeStore, "--checkpoint", "ckpt-fake", "--output", out, "--reuse-image"]);
-    // The CLI's own mkdir may fail before docker runs; either way the
-    // failure must be reported and nonzero.
-    expect(outcome.status).not.toBe(0);
-    if (outcome.report !== undefined) {
-      expect(outcome.report.status).not.toBe("PASS");
-      for (const c of outcome.report.checks) {
-        expect(c.ok).toBe(false);
-      }
+  it.each([ ["build", "runtime.image-build"], ["run", "worker.run"] ])("reports a %s infrastructure failure with complete evidence", (failure, check) => {
+    // Deterministic engine-failure injection. Real OpenCode/container
+    // restoration remains covered by the separate container suite.
+    const bin = join(scratch, `engine-${failure}`);
+    mkdirSync(bin);
+    const docker = join(bin, "docker");
+    writeFileSync(docker, `#!/bin/sh
+case "$1" in
+version) echo 1; exit 0 ;;
+build) ${failure === "build" ? "exit 23" : "exit 0"} ;;
+image) echo fake-image; exit 0 ;;
+run) exit 23 ;;
+esac
+exit 1
+`);
+    chmodSync(docker, 0o755);
+    const out = join(scratch, `out-${failure}`);
+    const outcome = runCli(out, ["--store", fakeStore, "--checkpoint", "ckpt-fake", "--output", out], { PATH: `${bin}:${process.env["PATH"] ?? ""}` });
+    expectFailureShape(outcome, check!, failure === "build" ? "docker build failed" : "without producing a report");
+    for (const name of ["selection.json", "runtime.json", "comparison.json", "regenerated-request.json", "trace.jsonl"]) {
+      expect(existsSync(join(out, name)), name).toBe(true);
     }
+    expect(JSON.parse(readFileSync(join(out, "regenerated-request.json"), "utf8")).status).toBe("unavailable");
   });
 });

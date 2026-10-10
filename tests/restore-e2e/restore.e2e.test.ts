@@ -159,6 +159,14 @@ function resultOf(outDir: string): { status: string; checks: Array<{ check: stri
 
 function checkNamed(outDir: string, name: string): { check: string; ok: boolean; detail: string } {
   const r = resultOf(outDir);
+  if (r.status !== "PASS") {
+    for (const name of ["selection.json", "runtime.json", "comparison.json", "regenerated-request.json", "trace.jsonl"]) {
+      expect(existsSync(join(outDir, name)), `missing failure report ${name}`).toBe(true);
+    }
+    for (const name of ["selection.identity", "objects.verified", "workspace.tree", "session.seeded", "request.interception", "request.comparison"]) {
+      expect(r.checks.some((entry) => entry.check === name), `missing check ${name}`).toBe(true);
+    }
+  }
   const found = r.checks.find((c) => c.check === name);
   expect(found, `missing check ${name} in ${JSON.stringify(r.checks.map((c) => c.check))}`).toBeDefined();
   return found!;
@@ -261,8 +269,8 @@ describe("S3-R6 bounded explicit failures", () => {
     const run = await runRestore(out, { store: bad });
     expect(run.status).not.toBe(0);
     expect(resultOf(out).status).toBe("FAIL");
-    expect(checkNamed(out, "selection.preflight").ok).toBe(false);
-    expect(checkNamed(out, "selection.preflight").detail).toContain("objects.missing");
+    expect(checkNamed(out, "objects.missing").ok).toBe(false);
+    expect(checkNamed(out, "objects.missing").detail).toContain("objects.missing");
     assertNoLeakedContainers();
   }, 240_000);
 
@@ -275,7 +283,7 @@ describe("S3-R6 bounded explicit failures", () => {
     const out = join(scratch, "neg-corrupt-object");
     const run = await runRestore(out, { store: bad });
     expect(run.status).not.toBe(0);
-    expect(checkNamed(out, "selection.preflight").detail).toContain("objects.corrupt");
+    expect(checkNamed(out, "objects.corrupt").detail).toContain("objects.corrupt");
   }, 240_000);
 
   it("fails on invalid context", async () => {
@@ -284,7 +292,7 @@ describe("S3-R6 bounded explicit failures", () => {
     const run = await runRestore(out, { store: bad });
     expect(run.status).not.toBe(0);
     expect(resultOf(out).status).toBe("FAIL");
-    expect(checkNamed(out, "selection.preflight").ok).toBe(false);
+    expect(checkNamed(out, "selection.record-missing").ok).toBe(false);
   }, 240_000);
 
   it("fails on runtime launch failure", async () => {

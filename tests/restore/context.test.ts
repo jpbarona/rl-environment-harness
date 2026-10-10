@@ -219,6 +219,22 @@ describe("S3-R4 request comparison", () => {
     expect(comparison.differences.some((d) => d.field.startsWith("messages[1]"))).toBe(true);
   });
 
+  it("rejects changed or missing system-message metadata", () => {
+    const [original, regenerated] = bodies();
+    (original["messages"] as Array<Record<string, unknown>>)[0]!["name"] = "original";
+    (regenerated["messages"] as Array<Record<string, unknown>>)[0]!["name"] = "changed";
+    expect(compareRequests({ original: { body: original }, regenerated: { body: regenerated }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot }).ok).toBe(false);
+    delete (regenerated["messages"] as Array<Record<string, unknown>>)[0]!["name"];
+    expect(compareRequests({ original: { body: original }, regenerated: { body: regenerated }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot }).ok).toBe(false);
+  });
+
+  it("does not normalize shell-runtime text in system instructions", () => {
+    const [original, regenerated] = bodies();
+    (original["messages"] as Array<Record<string, unknown>>)[0]!["content"] = "Commands run on macOS using zsh";
+    (regenerated["messages"] as Array<Record<string, unknown>>)[0]!["content"] = "Commands run on Linux using bash";
+    expect(compareRequests({ original: { body: original }, regenerated: { body: regenerated }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot }).ok).toBe(false);
+  });
+
   it("an extra message in the regenerated request fails comparison", () => {
     const [original, regenerated] = bodies();
     const extra = structuredClone(regenerated);

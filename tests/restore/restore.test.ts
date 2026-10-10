@@ -68,9 +68,10 @@ function buildFixture(): void {
         opencodeVersion: "2.0.18",
       }),
     );
+    writeFileSync(join(store, "checkpoints", ckpt, "session_state.json"), JSON.stringify({ session: { id: "ses_test" } }));
     writeFileSync(
       join(store, "checkpoints", ckpt, "prior_context.json"),
-      JSON.stringify({ turnId: "turn", priorMessages: [{ role: "user", content: "same words" }] }),
+      JSON.stringify({ turnId: classification === "task-new-turn" ? "turn-00000001" : "turn-00000002", priorMessages: [{ role: "user", content: "same words" }] }),
     );
   }
 }
@@ -106,6 +107,22 @@ describe("S3-R1 selection and preflight", () => {
     expect(() => selectCheckpoint({ storeRoot: store, checkpointId: "ckpt-nope" })).toThrow(
       /checkpoint-missing/,
     );
+  });
+
+  it("rejects missing session state and conflicting record identities", () => {
+    const dir = join(store, "checkpoints", ckpt2);
+    const sessionPath = join(dir, "session_state.json");
+    const session = readFileSync(sessionPath, "utf8");
+    rmSync(sessionPath);
+    expect(() => selectCheckpoint({ storeRoot: store, checkpointId: ckpt2 })).toThrow(/record-missing/);
+    writeFileSync(sessionPath, JSON.stringify({ session: { id: "wrong-session" } }));
+    expect(() => selectCheckpoint({ storeRoot: store, checkpointId: ckpt2 })).toThrow(/identity-conflict/);
+    writeFileSync(sessionPath, session);
+    const priorPath = join(dir, "prior_context.json");
+    const prior = readFileSync(priorPath, "utf8");
+    writeFileSync(priorPath, JSON.stringify({ turnId: "wrong-turn", priorMessages: [] }));
+    expect(() => selectCheckpoint({ storeRoot: store, checkpointId: ckpt2 })).toThrow(/identity-conflict/);
+    writeFileSync(priorPath, prior);
   });
 
   it("rejects a missing object before execution", () => {

@@ -43,10 +43,8 @@ const SYSTEM_PLATFORM = /\bPlatform: (darwin|linux|win32)\b/g;
 const SHELL_RUNTIME = /Commands run on (macOS using zsh|Linux using bash|Windows using PowerShell|Windows using cmd)/g;
 
 /** Neutralize runtime-specific phrases with exact, narrow scopes. */
-function neutralizeRuntime(text: string): string {
-  return text
-    .replace(SYSTEM_PLATFORM, "Platform: <runtime>")
-    .replace(SHELL_RUNTIME, "Commands run on <runtime>");
+function neutralizePlatform(text: string): string {
+  return text.replace(SYSTEM_PLATFORM, "Platform: <runtime>");
 }
 
 function replaceAll(text: string, needle: string, replacement: string): string {
@@ -110,7 +108,7 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
       return tools.map((tool) => {
         const t = tool as { function?: { name?: string; description?: string } };
         if (t?.function?.name === "shell" && typeof t.function.description === "string") {
-          return { ...t, function: { ...t.function, description: neutralizeRuntime(t.function.description) } };
+          return { ...t, function: { ...t.function, description: t.function.description.replace(SHELL_RUNTIME, "Commands run on <runtime>") } };
         }
         return tool;
       });
@@ -138,6 +136,12 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
         continue;
       }
       if (i === 0 && o.role === "system" && r.role === "system") {
+        const metadata = (message: Message): Record<string, unknown> => Object.fromEntries(
+          Object.entries(message).filter(([key]) => key !== "content"),
+        );
+        if (JSON.stringify(metadata(o)) !== JSON.stringify(metadata(r))) {
+          add("messages[0].metadata", metadata(o), metadata(r));
+        }
         const oc = typeof o.content === "string" ? o.content : JSON.stringify(o.content);
         const rc = typeof r.content === "string" ? r.content : JSON.stringify(r.content);
         let mapped = oc;
@@ -153,7 +157,7 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
           mapped = replaceAll(mapped, input.capturedTmpPath, input.restoreTmpPath);
         }
         const beforePlatform = mapped;
-        mapped = neutralizeRuntime(mapped);
+        mapped = neutralizePlatform(mapped);
         if (mapped !== beforePlatform) {
           declared.push({
             field: "system.platform",
@@ -170,7 +174,7 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
             detail: "date line neutralized on both sides",
           });
         }
-        const rcNeutral = dateLine(neutralizeRuntime(rc));
+        const rcNeutral = dateLine(neutralizePlatform(rc));
         if (mapped !== rcNeutral) {
           const at = firstDifferenceIndex(mapped, rcNeutral);
           differences.push({
