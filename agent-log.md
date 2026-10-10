@@ -638,3 +638,42 @@ All six requirements have passing evidence at the current revision; type checkin
 - The comparator transforms only the declared volatile fields; a compaction summary containing capture-host paths would require an additional declared mapping (backlog; the deterministic mock summary contains none).
 - The declared `compaction.replay-prompt` structural difference is documented in docs/restore.md's policy table; the wrapper itself is compared exactly.
 - Restore targets linux/arm64 (host is Apple Silicon); an x64 lock is a backlog item.
+
+## Entry 020 — Step 3 review fixes: exact compaction replay, symlink traversal, CLI failure reports
+
+**Author:** OpenCode implementing agent. **Date:** 2026-10-10 night, America/New_York. **Branch:** `step-3`. **Revision:** working tree after `b89db06`, uncommitted at entry time. **Image:** `rl-restore:2.0.18` (unchanged this entry; identity `sha256:8c723a9b920f...`).
+
+### Violation 1 — S3-R4 compacted context (closed; no comparator exception remains)
+
+- **Root cause of the earlier duplication:** the replay submitted the pending prompt through the CLI, which appended it as a second user message; a `compaction.replay-prompt` comparator exception tolerated it. Removed entirely.
+- **Faithful replay:** the worker seeds the pre-compaction conversation from the captured compaction call (`compaction_requests.jsonl`, minus its system and summarize-instruction messages) and submits the pending prompt once. Real OpenCode re-runs its own compaction; the interception proxy answers that call with the captured summary, so OpenCode rebuilds the identical checkpoint wrapper. The regenerated request is `[system, wrapper]` — the prompt appears exactly once, no extra message. [Citation: `src/restore/worker.ts` compaction-source block; `src/capture/proxy.ts` intercept branch (`compactionResponse`).]
+- **Capture-side defect found and fixed:** `compaction.json` stored the raw SSE response body instead of the summary text; `#recordCompactionSummary` now extracts the concatenated delta content. The restore worker also handles old-format records. [Citation: `src/capture/proxy.ts`; the earlier container failure "Compaction summary did not match the required template".]
+- **Comparator:** strict again — the `compaction.replay-prompt` declared transform and its documentation row are removed; `RequestCompareInput.compaction` removed. New unit negative: an extra message in the regenerated request fails comparison (`messages.length`), with no declared volatile able to hide it. [Citation: `tests/restore/context.test.ts`.]
+- **E2E evidence:** the compacted-context restore passes with the regenerated request `[system, wrapper]` (2 messages), the prompt text occurring exactly once, and `request.comparison` ok with only the four standing declared transforms. [Citation: `tests/restore-e2e/restore.e2e.test.ts` S3-R4 compacted context; `run-compaction/result.json` all checks ok, `comparison.json` diffs [].]
+
+### Violation 2 — S3-R2 symlink traversal (closed)
+
+- The old depth check counted only leading `..` segments, accepting `escape -> sub/../../outside`. Validation now resolves EVERY target component against the link's parent depth; any climb past the workspace root rejects the manifest before any write. [Citation: `src/restore/materialize.ts`.]
+- New unit cases: `escape -> sub/../../outside` rejected; nested `a/b/link -> ../../../outside` rejected; valid internal links (`a/b/ok-link -> ../../ok.txt`, `a/l3 -> ../ok.txt`) accepted. [Citation: `tests/restore/restore.test.ts` symlink safety.]
+
+### Violation 3 — S3-R7 failure reports (closed)
+
+- The CLI now writes the machine-readable `result.json` on every failure path: docker unavailable (`runtime.docker`, status `BLOCKED`), missing store (`selection.store-missing`), missing checkpoint (`selection.checkpoint-missing`), image build failure (`runtime.image-build`), a worker that exits without a report (`worker.run`), and unexpected CLI errors (`cli.unexpected`). The failed check carries the detail; every check that could not run is explicitly marked `not run`; PASS is never claimed on a failure path; exit is always nonzero. [Citation: `src/restore/cli.ts` `writeFailureReport`; docs/restore.md Failure semantics.]
+- New unit tests spawn the CLI directly: docker-unavailable (PATH override), missing store, missing checkpoint, and a container exiting without a report — each asserts the report exists, the failed check is named, and no check claims success. [Citation: `tests/restore/cli-failure.test.ts`, 4 passed.]
+
+### Verification (commands and results)
+
+1. `npm run typecheck` — exit 0.
+2. `npm run test` — 69 passed (includes the new comparator negative, symlink-traversal cases, and 4 CLI failure-report tests).
+3. `npm run test:e2e` — 5 passed (real OpenCode capture suite, unchanged).
+4. `npx vitest run tests/restore-e2e` — 12 passed, 0 failed (real Linux container, real OpenCode v2.0.18, pinned image): pinned-runtime probe; ordinary two-turn restore; repeated restoration; mutation isolation; six negative fixtures; compacted-context restore (exact sequence); truncated-artifact restore (bytes verified); no leaked containers; zero outbound inference.
+- Evidence roots: `work/e2e/restore-fixture-*`, `work/e2e/restore-compaction-*`, `work/e2e/restore-truncation-*` plus per-run `result.json` / `comparison.json` / `regenerated-request.json` / `runtime.json` / `seed.sql` / `trace.jsonl` under the suite scratch dirs.
+
+### S3-R1–R7 status (honest)
+
+R1 PASS (selection/preflight, identity-based, negatives) · R2 PASS (exact tree, symlink traversal rejected, negative fixtures) · R3 PASS (digest-pinned image, version-pinned snapshot deps, probe) · R4 PASS (ordinary, compacted, and truncated fixtures; strict comparator with only the four documented volatile transforms; settings fully compared; no duplication) · R5 PASS (repeated restoration with real mutation isolation) · R6 PASS (bounded failures with named checks and no forwarding) · R7 PASS (documented command; machine-readable reports on every failure path).
+
+### Limitations
+
+- The comparator's declared transforms remain exactly: system paths, platform line, date line, shell-description runtime phrase. A compaction summary containing capture-host paths would need a further declared mapping (backlog; the deterministic mock summary contains none).
+- Restore targets linux/arm64 (Apple Silicon host); an x64 lock is a backlog item.

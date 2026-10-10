@@ -7,9 +7,14 @@
  * Validates the environment, builds/uses the pinned image, runs the restore
  * worker inside a fresh container with the capture store mounted read-only,
  * and propagates the worker's exit code. Zero on PASS only.
+ *
+ * Every failure path — docker unavailable, missing store/checkpoint, image
+ * build failure, a worker that exits without a report, or an unexpected
+ * error — writes the machine-readable `result.json` failure report with the
+ * failed check named and every check that could not run marked explicitly.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,6 +27,29 @@ interface Args {
   readonly timeoutMs?: number | undefined;
   readonly mutateAfterCompare?: boolean;
 }
+
+/** Every check the worker would perform, in execution order, plus the
+ * CLI-level checks that can fail before or around the worker. */
+const WORKER_CHECKS = [
+  "selection.identity",
+  "objects.verified",
+  "workspace.materialized",
+  "workspace.tree",
+  "workspace.git-init",
+  "workspace.config-rebind",
+  "artifacts.materialized",
+  "session.db-init",
+  "session.seeded",
+  "request.interception",
+  "request.comparison",
+  "outbound.inference-count",
+  "runtime.docker",
+  "runtime.image-build",
+  "selection.store-missing",
+  "selection.checkpoint-missing",
+  "worker.run",
+  "cli.unexpected",
+] as const;
 
 function parseArgs(argv: readonly string[]): Args {
   const get = (flag: string): string | undefined => {
@@ -50,91 +78,154 @@ function parseArgs(argv: readonly string[]): Args {
 const repoRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
 const args = parseArgs(process.argv.slice(2));
 
-// Environment gate: docker must be usable.
-const dockerCheck = spawnSync("docker", ["version", "--format", "{{.Server.Version}}"], { encoding: "utf8" });
-if (dockerCheck.status !== 0) {
-  console.error("BLOCKED: docker daemon is unavailable; a Linux container runtime is required.");
-  process.exit(1);
+/**
+ * Write the required machine-readable failure report. The named check
+ * carries the failure detail; every other worker check is marked as not
+ * run. Never claims PASS.
+ */
+function writeFailureReport(
+  status: "FAIL" | "BLOCKED",
+  failedCheck: string,
+  detail: string,
+): void {
+  try {
+    mkdirSync(args.output, { recursive: true });
+  } catch {
+    // The output path itself is unusable; nothing more can be retained.
+  }
+  const checks = WORKER_CHECKS.map((name) =>
+    name === failedCheck
+      ? { check: name, ok: false, detail: `FAILED — ${detail}` }
+      : { check: name, ok: false, detail: "not run: the run failed before this check" },
+  );
+  try {
+    writeFileSync(
+      join(args.output, "result.json"),
+      `${JSON.stringify({
+        status,
+        checkpoint: args.checkpoint,
+        runStarted: new Date().toISOString(),
+        store: args.store,
+        checks,
+        result: detail,
+      }, null, 2)}\n`,
+    );
+  } catch {
+    // Best effort: the failure is also printed to stderr below.
+  }
+  console.error(`RESTORE ${status}: failed check=${failedCheck} — ${detail}`);
+  console.error(`Report: ${join(args.output, "result.json")}`);
 }
 
-for (const [label, path] of [
-  ["capture store", args.store],
-  ["checkpoint directory", join(args.store, "checkpoints", args.checkpoint)],
-] as const) {
-  if (!existsSync(path)) {
-    console.error(`BLOCKED: ${label} does not exist: ${path}`);
+function main(): void {
+  // Environment gate: docker must be usable.
+  const dockerCheck = spawnSync("docker", ["version", "--format", "{{.Server.Version}}"], { encoding: "utf8" });
+  if (dockerCheck.status !== 0) {
+    writeFailureReport(
+      "BLOCKED",
+      "runtime.docker",
+      `docker daemon is unavailable (exit ${dockerCheck.status}); a Linux container runtime is required`,
+    );
     process.exit(1);
   }
-}
 
-const lockPath = join(repoRoot, "containers", "restore", "lock.json");
-const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
-  readonly image: string;
-  readonly imageDigest: string;
-  readonly tag: string;
-  readonly platform: string;
-  readonly opencode: { readonly version: string; readonly url: string; readonly sha256: string; readonly binPath: string };
-};
+  for (const [check, label, path] of [
+    ["selection.store-missing", "capture store", args.store],
+    ["selection.checkpoint-missing", "checkpoint directory", join(args.store, "checkpoints", args.checkpoint)],
+  ] as const) {
+    if (!existsSync(path)) {
+      writeFailureReport("FAIL", check, `${label} does not exist: ${path}`);
+      process.exit(1);
+    }
+  }
 
-// Build (or reuse) the pinned image.
-const imageRef = `${lock.tag}:${lock.opencode.version}`;
-if (args.reuseImage !== true) {
-  console.log(`Building pinned image ${imageRef} ...`);
-  const build = spawnSync(
+  const lockPath = join(repoRoot, "containers", "restore", "lock.json");
+  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+    readonly image: string;
+    readonly imageDigest: string;
+    readonly tag: string;
+    readonly platform: string;
+    readonly opencode: { readonly version: string; readonly url: string; readonly sha256: string; readonly binPath: string };
+  };
+
+  // Build (or reuse) the pinned image.
+  const imageRef = `${lock.tag}:${lock.opencode.version}`;
+  if (args.reuseImage !== true) {
+    console.log(`Building pinned image ${imageRef} ...`);
+    const build = spawnSync(
+      "docker",
+      ["build", "--platform", lock.platform, "-t", imageRef, join(repoRoot, "containers", "restore")],
+      { stdio: "inherit" },
+    );
+    if (build.status !== 0) {
+      writeFailureReport("FAIL", "runtime.image-build", `docker build failed with exit ${build.status}; see the build output above`);
+      process.exit(1);
+    }
+  }
+
+  mkdirSync(args.output, { recursive: true });
+  const runId = `restore-${Date.now()}`;
+  const harnessDist = join(repoRoot, "dist");
+
+  // Runtime identity (S3-R3): image id, node, sqlite, opencode lock hash.
+  const imageId = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", imageRef], { encoding: "utf8" }).stdout?.trim() ?? "";
+  const imageDigest = spawnSync("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", imageRef], { encoding: "utf8" }).stdout?.trim() ?? "[]";
+  const opencodeSha = spawnSync("docker", ["run", "--rm", imageRef, "shasum", "-a", "256", lock.opencode.binPath], { encoding: "utf8" }).stdout?.split(" ")[0] ?? "";
+  const sqliteVersion = spawnSync("docker", ["run", "--rm", imageRef, "bash", "-c", "cat /usr/local/share/harness-sqlite-version"], { encoding: "utf8" }).stdout?.trim() ?? "";
+  const harnessRevision = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", cwd: repoRoot }).stdout?.trim() ?? "unknown";
+
+  console.log(`Running restore worker (${runId}) ...`);
+  const run = spawnSync(
     "docker",
-    ["build", "--platform", lock.platform, "-t", imageRef, join(repoRoot, "containers", "restore")],
+    [
+      "run", "--rm", "--name", runId,
+      "--platform", "linux/arm64",
+      "-v", `${args.store}:/work/store:ro`,
+      "-v", `${args.output}:/work/evidence:rw`,
+      "-v", `${harnessDist}:/opt/harness/dist:ro`,
+      imageRef,
+      "node", "/opt/harness/dist/restore/worker.js",
+      "--store", "/work/store",
+      "--checkpoint", args.checkpoint,
+      "--output", "/work/evidence",
+      "--workspace", "/work/workspace",
+      "--home", "/work/home",
+      "--tmp", "/work/tmp",
+      "--opencode-bin", args.opencodeBin ?? lock.opencode.binPath,
+      "--image-id", imageId,
+      "--image-digests", imageDigest,
+      "--opencode-sha256", opencodeSha,
+      "--sqlite-version", sqliteVersion,
+      "--harness-revision", harnessRevision,
+      ...(args.timeoutMs !== undefined ? ["--timeout-ms", String(args.timeoutMs)] : []),
+      ...(args.mutateAfterCompare === true ? ["--mutate-after-compare"] : []),
+    ],
     { stdio: "inherit" },
   );
-  if (build.status !== 0) {
-    console.error("BLOCKED: image build failed.");
-    process.exit(1);
+
+  // The worker writes its own result.json on every bounded failure. If the
+  // container exited nonzero WITHOUT one (worker crash, engine error), the
+  // CLI records the failure with all worker checks marked as not run.
+  const resultPath = join(args.output, "result.json");
+  if (run.status !== 0 && !existsSync(resultPath)) {
+    writeFailureReport(
+      "FAIL",
+      "worker.run",
+      `the restore worker exited ${run.status ?? "abnormally"} without producing a report (container ${runId})`,
+    );
+    process.exit(run.status ?? 1);
   }
+  if (run.status !== 0) {
+    console.error(`RESTORE FAILED (exit ${run.status}). Evidence: ${args.output}`);
+    process.exit(run.status ?? 1);
+  }
+  console.log(`Evidence: ${args.output}`);
+  process.exit(0);
 }
 
-mkdirSync(args.output, { recursive: true });
-const runId = `restore-${Date.now()}`;
-const harnessDist = join(repoRoot, "dist");
-
-// Runtime identity (S3-R3): image id, node, sqlite, opencode lock hash.
-const imageId = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", imageRef], { encoding: "utf8" }).stdout?.trim() ?? "";
-const imageDigest = spawnSync("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", imageRef], { encoding: "utf8" }).stdout?.trim() ?? "[]";
-const opencodeSha = spawnSync("docker", ["run", "--rm", imageRef, "shasum", "-a", "256", lock.opencode.binPath], { encoding: "utf8" }).stdout?.split(" ")[0] ?? "";
-const sqliteVersion = spawnSync("docker", ["run", "--rm", imageRef, "bash", "-c", "cat /usr/local/share/harness-sqlite-version"], { encoding: "utf8" }).stdout?.trim() ?? "";
-const harnessRevision = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", cwd: repoRoot }).stdout?.trim() ?? "unknown";
-
-console.log(`Running restore worker (${runId}) ...`);
-const run = spawnSync(
-  "docker",
-  [
-    "run", "--rm", "--name", runId,
-    "--platform", "linux/arm64",
-    "-v", `${args.store}:/work/store:ro`,
-    "-v", `${args.output}:/work/evidence:rw`,
-    "-v", `${harnessDist}:/opt/harness/dist:ro`,
-    imageRef,
-    "node", "/opt/harness/dist/restore/worker.js",
-    "--store", "/work/store",
-    "--checkpoint", args.checkpoint,
-    "--output", "/work/evidence",
-    "--workspace", "/work/workspace",
-    "--home", "/work/home",
-    "--tmp", "/work/tmp",
-    "--opencode-bin", args.opencodeBin ?? lock.opencode.binPath,
-    "--image-id", imageId,
-    "--image-digests", imageDigest,
-    "--opencode-sha256", opencodeSha,
-    "--sqlite-version", sqliteVersion,
-    "--harness-revision", harnessRevision,
-    ...(args.timeoutMs !== undefined ? ["--timeout-ms", String(args.timeoutMs)] : []),
-    ...(args.mutateAfterCompare === true ? ["--mutate-after-compare"] : []),
-  ],
-  { stdio: "inherit" },
-);
-
-// The worker controls its own exit code; docker run propagates it.
-if (run.status !== 0) {
-  console.error(`RESTORE FAILED (exit ${run.status}). Evidence: ${args.output}`);
-  process.exit(run.status ?? 1);
+try {
+  main();
+} catch (err) {
+  writeFailureReport("FAIL", "cli.unexpected", String(err instanceof Error ? (err.stack ?? err.message) : err));
+  process.exit(1);
 }
-console.log(`Evidence: ${args.output}`);
-process.exit(0);

@@ -249,7 +249,16 @@ describe("S3-R2 safety rejections", () => {
     expect(() => validateManifest(syntheticManifest("a/l2", { kind: "symlink", target: "../../etc/passwd" }))).toThrow(
       /link-escaping/,
     );
-    // Depth-safe relative target is accepted.
+    // Traversal AFTER ordinary components also escapes.
+    expect(() => validateManifest(syntheticManifest("escape", { kind: "symlink", target: "sub/../../outside" }))).toThrow(
+      /link-escaping/,
+    );
+    // Nested links: traversal out of a deep directory escapes.
+    expect(() => validateManifest(syntheticManifest("a/b/link", { kind: "symlink", target: "../../../outside" }))).toThrow(
+      /link-escaping/,
+    );
+    // Valid internal links are accepted: staying inside the workspace.
+    expect(() => validateManifest(syntheticManifest("a/b/ok-link", { kind: "symlink", target: "../../ok.txt" }))).not.toThrow();
     expect(() => validateManifest(syntheticManifest("a/l3", { kind: "symlink", target: "../ok.txt" }))).not.toThrow();
   });
 

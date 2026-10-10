@@ -32,8 +32,6 @@ export interface RequestCompareInput {
   readonly capturedTmpPath?: string;
   /** Container tmp path. */
   readonly restoreTmpPath?: string;
-  /** Present when the selected turn's context was compacted. */
-  readonly compaction?: { readonly prompt: string } | undefined;
 }
 
 interface Message {
@@ -129,15 +127,7 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
   }
 
   if (origMessages.length !== regenMessages.length) {
-    // Compacted-turn replay: the replay mechanism submits the pending
-    // prompt through the CLI, which appends it as one extra user message
-    // after the unchanged checkpoint wrapper. Anything else is a failure.
-    const expectedReplayLength = input.compaction !== undefined ? origMessages.length + 1 : origMessages.length;
-    if (regenMessages.length !== expectedReplayLength) {
-      add("messages.length", expectedReplayLength, regenMessages.length);
-    }
-  } else if (input.compaction !== undefined) {
-    add("messages.length", origMessages.length, `${origMessages.length} (replay expects +1)`);
+    add("messages.length", origMessages.length, regenMessages.length);
   }
   const common = Math.min(origMessages.length, regenMessages.length);
   for (let i = 0; i < common; i += 1) {
@@ -195,20 +185,6 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
         add(`messages[${i}]`, o, r);
       }
   }
-  if (input.compaction !== undefined && regenMessages.length === origMessages.length + 1) {
-    // The replay-appended prompt must equal the selected turn's argv text.
-    const extra = regenMessages[regenMessages.length - 1]!;
-    const expectedExtra = { role: "user", content: JSON.stringify(input.compaction.prompt) };
-    declared.push({
-      field: "compaction.replay-prompt",
-      reason: "the replay submits the pending prompt through the OpenCode CLI, which appends it as a new user message after the unchanged compaction wrapper (the original turn carried it inside the wrapper)",
-      detail: `appended message must equal ${JSON.stringify(expectedExtra.content).slice(0, 80)}`,
-    });
-    if (JSON.stringify(extra) !== JSON.stringify(expectedExtra)) {
-      add("messages.replay-prompt", expectedExtra, extra);
-    }
-  }
-
   return { ok: differences.length === 0, declaredVolatile: declared, differences };
 }
 

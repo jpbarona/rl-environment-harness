@@ -219,53 +219,20 @@ describe("S3-R4 request comparison", () => {
     expect(comparison.differences.some((d) => d.field.startsWith("messages[1]"))).toBe(true);
   });
 
-  it("compacted-turn replay: wrapper exact plus the replay-appended prompt", () => {
-    const summary = "## Objective\n- probe.\n- MARKER";
-    const wrapper = [
-      "<conversation-checkpoint>",
-      "intro",
-      "",
-      "<summary>",
-      summary,
-      "</summary>",
-      "",
-      "<recent-context>",
-      '[User]: "and then reply briefly"',
-      "</recent-context>",
-      "</conversation-checkpoint>",
-    ].join("\n");
-    const [original] = bodies();
-    const compactedOriginal = { ...original, messages: [{ role: "system", content: "s" }, { role: "user", content: wrapper }] };
-    const regenerated = {
-      ...original,
-      messages: [
-        { role: "system", content: "s" },
-        { role: "user", content: wrapper },
-        { role: "user", content: JSON.stringify("and then reply briefly") },
-      ],
-    };
+  it("an extra message in the regenerated request fails comparison", () => {
+    const [original, regenerated] = bodies();
+    const extra = structuredClone(regenerated);
+    (extra["messages"] as unknown[]).push({ role: "user", content: '"and then reply briefly"' });
     const comparison = compareRequests({
-      original: { body: compactedOriginal },
-      regenerated: { body: regenerated },
+      original: { body: original },
+      regenerated: { body: extra },
       capturedWorkspaceRoot: capturedRoot,
       restoreWorkspacePath: restoreRoot,
-      compaction: { prompt: "and then reply briefly" },
     });
-    expect(comparison.ok).toBe(true);
-    expect(comparison.declaredVolatile.some((v) => v.field === "compaction.replay-prompt")).toBe(true);
-
-    // A changed wrapper or wrong appended prompt fails.
-    const changedWrapper = JSON.parse(JSON.stringify(regenerated));
-    changedWrapper.messages[1].content = wrapper.replace("MARKER", "CHANGED");
-    expect(
-      compareRequests({ original: { body: compactedOriginal }, regenerated: { body: changedWrapper }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot, compaction: { prompt: "and then reply briefly" } }).ok,
-    ).toBe(false);
-
-    const wrongPrompt = JSON.parse(JSON.stringify(regenerated));
-    wrongPrompt.messages[2].content = JSON.stringify("different prompt");
-    expect(
-      compareRequests({ original: { body: compactedOriginal }, regenerated: { body: wrongPrompt }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot, compaction: { prompt: "and then reply briefly" } }).ok,
-    ).toBe(false);
+    expect(comparison.ok).toBe(false);
+    expect(comparison.differences.some((d) => d.field === "messages.length")).toBe(true);
+    // No declared volatile may hide an appended message.
+    expect(comparison.declaredVolatile.every((v) => !v.field.startsWith("compaction"))).toBe(true);
   });
 
   it("extracts the selected turn input from the primary request", () => {

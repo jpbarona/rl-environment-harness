@@ -107,6 +107,12 @@ export interface CaptureProxyOptions {
    */
   readonly artifactPathRewrite?: (path: string) => string | undefined;
   /**
+   * Restore mode: the captured compaction summary. A background-compaction
+   * request is answered with this text so real OpenCode rebuilds the same
+   * checkpoint wrapper it produced at capture time.
+   */
+  readonly compactionResponse?: string | undefined;
+  /**
    * Runtime/configuration references persisted with every checkpoint.
    * Example: { opencodeVersion, configPath, isolatedHome, providerBaseURL }.
    */
@@ -777,6 +783,29 @@ export class CaptureProxy {
     if (turn === undefined || turn.checkpointId === null) {
       return;
     }
+    // The response is an SSE stream; the summary is the concatenated delta
+    // content, not the raw body.
+    let summary = "";
+    for (const line of responseText.split("\n")) {
+      if (!line.startsWith("data: ")) {
+        continue;
+      }
+      const payload = line.slice(6);
+      if (payload.trim() === "[DONE]") {
+        continue;
+      }
+      try {
+        const chunk = JSON.parse(payload) as {
+          choices?: Array<{ delta?: { content?: string } }>;
+        };
+        summary += chunk.choices?.[0]?.delta?.content ?? "";
+      } catch {
+        // Malformed chunk; skip it.
+      }
+    }
+    if (summary.length === 0) {
+      summary = responseText;
+    }
     const dir = join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId);
     mkdirSync(dir, { recursive: true });
     const file = join(dir, "compaction.json");
@@ -792,12 +821,12 @@ export class CaptureProxy {
     } catch {
       // No prior authoritative record; start one.
     }
-    record.summaries.push({ at: new Date().toISOString(), status, summary: responseText });
+    record.summaries.push({ at: new Date().toISOString(), status, summary });
     writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
     this.#options.trace.append("compaction.summary.recorded", {
       turnId,
       status,
-      bytes: responseText.length,
+      bytes: summary.length,
     });
   }
 
@@ -1164,6 +1193,13 @@ export class CaptureProxy {
     // Restore mode: answer locally, never open an upstream connection.
     if (this.#options.interceptRequests === true) {
       const model = recorded.model ?? "unknown";
+      // A compaction call is answered with the captured summary so real
+      // OpenCode rebuilds the same checkpoint wrapper it produced at
+      // capture time; everything else gets the generic canned response.
+      const isCompaction = recorded.classification === "background-compaction";
+      const content = isCompaction && this.#options.compactionResponse !== undefined
+        ? this.#options.compactionResponse
+        : "Restore interception: no model executed.";
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -1171,7 +1207,7 @@ export class CaptureProxy {
       const created = Math.floor(Date.now() / 1000);
       const id = "restore-intercepted";
       for (const delta of [
-        { role: "assistant", content: "Restore interception: no model executed." },
+        { role: "assistant", content },
         {},
       ] as const) {
         const finish = delta.role === undefined ? "stop" : null;

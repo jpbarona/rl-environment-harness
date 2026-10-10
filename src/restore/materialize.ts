@@ -71,17 +71,23 @@ export function validateManifest(manifest: WorkspaceSnapshot): void {
       if (record.target.startsWith("/") || /^[A-Za-z]:/.test(record.target)) {
         throw new RestoreError("materialize.link-absolute", `${record.path}: absolute link target ${record.target}`);
       }
-      // Depth check: climbing ".." beyond the link's directory escapes the
-      // workspace root. The link's directory is path minus its last segment.
+      // Resolve every component of the target against the link's parent
+      // directory: climbing ".." beyond the workspace root escapes it, even
+      // after ordinary components (e.g. "sub/../../outside").
       const dirDepth = record.path.split("/").length - 1;
-      let climb = 0;
-      let cursor = record.target;
-      while (cursor === ".." || cursor.startsWith("../")) {
-        climb += 1;
-        cursor = cursor.slice(3);
-      }
-      if (climb > dirDepth) {
-        throw new RestoreError("materialize.link-escaping", `${record.path}: target ${record.target} escapes the workspace`);
+      let depth = dirDepth;
+      for (const part of record.target.split("/")) {
+        if (part === "" || part === ".") {
+          continue;
+        }
+        if (part === "..") {
+          depth -= 1;
+          if (depth < 0) {
+            throw new RestoreError("materialize.link-escaping", `${record.path}: target ${record.target} escapes the workspace`);
+          }
+          continue;
+        }
+        depth += 1;
       }
       symlinkPaths.add(record.path);
     }

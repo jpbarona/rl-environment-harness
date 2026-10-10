@@ -350,17 +350,18 @@ describe("S3-R4 compacted context", () => {
     expect(checkNamed(out, "session.seeded").ok).toBe(true);
     expect(checkNamed(out, "request.comparison").ok).toBe(true);
     expect(checkNamed(out, "outbound.inference-count").ok).toBe(true);
-    // The compacted summary is part of the regenerated input.
+    // The regenerated sequence matches the captured one exactly: the
+    // checkpoint wrapper carries the summary and the pending prompt once;
+    // no extra message is appended.
     const regenerated = JSON.parse(readFileSync(join(out, "regenerated-request.json"), "utf8")) as {
       body: { messages: Array<{ role: string; content: string }> };
     };
     expect(JSON.stringify(regenerated.body.messages)).toContain("COMPACTION-SUMMARY-MARKER-424242");
-    // The wrapper's recent section carries the pending prompt once, and the
-    // replay appends it as the declared extra user message.
-    const wrapper = regenerated.body.messages[1]!.content;
-    const recent = wrapper.slice(wrapper.indexOf("<recent-context>"), wrapper.indexOf("</recent-context>"));
-    expect(recent.split("and then reply briefly").length - 1).toBe(1);
-    expect(regenerated.body.messages[2]).toEqual({ role: "user", content: JSON.stringify("and then reply briefly") });
+    const messageText = JSON.stringify(regenerated.body.messages);
+    // The prompt text appears exactly once in the whole request (inside the
+    // wrapper's recent section): no duplicated user message exists.
+    expect(messageText.split("and then reply briefly").length - 1).toBe(1);
+    expect(regenerated.body.messages).toHaveLength(2);
     assertNoLeakedContainers();
   }, 540_000);
 });

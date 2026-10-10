@@ -113,6 +113,100 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     return result("FAIL");
   }
 
+
+
+  // S3-R4: materialize referenced tool-output artifacts at their mapped
+  // paths. The capture recorded each artifact's absolute path (inside the
+  // capture home) and content hash; the same relative suffix is recreated
+  // under the container home so the restored context references a real file.
+  const artifactsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "referenced_artifacts.json");
+  const artifactMappings: Array<{ originalPath: string; restorePath: string; sha256: string }> = [];
+  if (existsSync(artifactsPath)) {
+    const captureHomePrefix = join(selection.capturedWorkspaceRoot, "..", "home");
+    const referenced = JSON.parse(readFileSync(artifactsPath, "utf8")) as Array<{ originalPath: string; sha256: string }>;
+    for (const artifact of referenced) {
+      verifyObject(options.storeRoot, artifact.sha256, `artifact ${artifact.originalPath}`);
+      if (!artifact.originalPath.startsWith(captureHomePrefix)) {
+        throw new RestoreError("artifacts.path-outside-capture-home", artifact.originalPath);
+      }
+      const restorePath = options.homePath + artifact.originalPath.slice(captureHomePrefix.length);
+      mkdirSync(resolve(restorePath, ".."), { recursive: true });
+      copyFileSync(join(options.storeRoot, "objects", artifact.sha256), restorePath);
+      const copied = createHash("sha256").update(readFileSync(restorePath)).digest("hex");
+      if (copied !== artifact.sha256) {
+        throw new RestoreError("artifacts.bytes-mismatch", restorePath);
+      }
+      artifactMappings.push({ originalPath: artifact.originalPath, restorePath, sha256: artifact.sha256 });
+    }
+  }
+  record("artifacts.materialized", true, artifactMappings.length === 0 ? "no referenced artifacts" : JSON.stringify(artifactMappings));
+
+  // Fresh private OpenCode session store.
+  const xdgData = join(options.homePath, "data");
+  const xdgConfig = join(options.homePath, "cfg");
+  for (const dir of [xdgData, xdgConfig, join(options.homePath, "cache"), options.tmpPath]) {
+    mkdirSync(dir, { recursive: true });
+  }
+
+  // S3-R4: seed the prior conversation (prefix before the selected request).
+  const requestsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "model_requests.jsonl");
+  const requests = readJsonl<RequestRecord>(requestsPath);
+  const primary = requests.find((r) => r.classification === "task-new-turn" || r.classification === "task-continuation")!;
+  const turnInput = selectedTurnInput(primary.body);
+  const prompt = turnInput.prompt;
+
+  // S3-R4, compacted turns: real OpenCode re-runs its own compaction on the
+  // restored pre-compaction conversation. The seed comes from the captured
+  // compaction call (compaction_requests.jsonl), and the interception proxy
+  // answers the replayed compaction call with the captured summary so the
+  // rebuilt checkpoint wrapper matches byte-for-byte.
+  let compactionHistory: never[] | undefined;
+  let compactionSummary: string | undefined;
+  if (turnInput.compaction !== undefined) {
+    const compactionRequestsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "compaction_requests.jsonl");
+    if (!existsSync(compactionRequestsPath)) {
+      record("seed.compaction-source", false, "compaction_requests.jsonl is absent; the pre-compaction conversation cannot be restored");
+      return result("FAIL");
+    }
+    const compactionRecord = readJsonl<{ body: { messages: never[] } }>(compactionRequestsPath).at(-1);
+    const compactionMessages = compactionRecord?.body?.messages;
+    if (!Array.isArray(compactionMessages) || compactionMessages.length < 3) {
+      record("seed.compaction-source", false, "compaction_requests.jsonl lacks the pre-compaction conversation");
+      return result("FAIL");
+    }
+    // Drop the leading system message (OpenCode regenerates it) and the
+    // trailing summarize instruction (part of the compaction call itself).
+    compactionHistory = compactionMessages.slice(1, -1) as never[];
+    const compactionJsonPath = join(checkpointDir(options.storeRoot, options.checkpointId), "compaction.json");
+    const compactionJson = JSON.parse(readFileSync(compactionJsonPath, "utf8")) as {
+      summaries?: Array<{ summary?: string }>;
+    };
+    compactionSummary = compactionJson.summaries?.at(-1)?.summary;
+    if (typeof compactionSummary !== "string" || compactionSummary.length === 0) {
+      record("seed.compaction-source", false, "compaction.json lacks the captured summary");
+      return result("FAIL");
+    }
+    // Older captures stored the raw SSE body; extract the delta content.
+    if (compactionSummary.startsWith("data: ")) {
+      let extracted = "";
+      for (const line of compactionSummary.split("\n")) {
+        if (!line.startsWith("data: ") || line.slice(6).trim() === "[DONE]") {
+          continue;
+        }
+        try {
+          const chunk = JSON.parse(line.slice(6)) as { choices?: Array<{ delta?: { content?: string } }> };
+          extracted += chunk.choices?.[0]?.delta?.content ?? "";
+        } catch {
+          // Malformed chunk; skip it.
+        }
+      }
+      if (extracted.length > 0) {
+        compactionSummary = extracted;
+      }
+    }
+    record("seed.compaction-source", true, `${compactionHistory.length} pre-compaction messages; summary ${compactionSummary.length} bytes`);
+  }
+
   // Start the interception proxy: every model request is answered locally.
   // Artifact references name paths inside the capture host's home; the
   // rewrite maps them to the materialized container copies (fail closed
@@ -130,6 +224,7 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     artifactRoots: [options.workspacePath, options.homePath],
     interceptRequests: true,
     identityTimeoutMs: 300_000,
+    compactionResponse: compactionSummary,
     artifactPathRewrite: (path) => {
       if (!path.startsWith(captureHomePrefix)) {
         return undefined;
@@ -185,45 +280,6 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   }
   record("workspace.config-rebind", true, runtimeRebinds.length === 0 ? "no runtime-bound references" : runtimeRebinds.map((r) => `${r.original} -> ${r.rebound}`).join("; "));
 
-  // S3-R4: materialize referenced tool-output artifacts at their mapped
-  // paths. The capture recorded each artifact's absolute path (inside the
-  // capture home) and content hash; the same relative suffix is recreated
-  // under the container home so the restored context references a real file.
-  const artifactsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "referenced_artifacts.json");
-  const artifactMappings: Array<{ originalPath: string; restorePath: string; sha256: string }> = [];
-  if (existsSync(artifactsPath)) {
-    const captureHomePrefix = join(selection.capturedWorkspaceRoot, "..", "home");
-    const referenced = JSON.parse(readFileSync(artifactsPath, "utf8")) as Array<{ originalPath: string; sha256: string }>;
-    for (const artifact of referenced) {
-      verifyObject(options.storeRoot, artifact.sha256, `artifact ${artifact.originalPath}`);
-      if (!artifact.originalPath.startsWith(captureHomePrefix)) {
-        throw new RestoreError("artifacts.path-outside-capture-home", artifact.originalPath);
-      }
-      const restorePath = options.homePath + artifact.originalPath.slice(captureHomePrefix.length);
-      mkdirSync(resolve(restorePath, ".."), { recursive: true });
-      copyFileSync(join(options.storeRoot, "objects", artifact.sha256), restorePath);
-      const copied = createHash("sha256").update(readFileSync(restorePath)).digest("hex");
-      if (copied !== artifact.sha256) {
-        throw new RestoreError("artifacts.bytes-mismatch", restorePath);
-      }
-      artifactMappings.push({ originalPath: artifact.originalPath, restorePath, sha256: artifact.sha256 });
-    }
-  }
-  record("artifacts.materialized", true, artifactMappings.length === 0 ? "no referenced artifacts" : JSON.stringify(artifactMappings));
-
-  // Fresh private OpenCode session store.
-  const xdgData = join(options.homePath, "data");
-  const xdgConfig = join(options.homePath, "cfg");
-  for (const dir of [xdgData, xdgConfig, join(options.homePath, "cache"), options.tmpPath]) {
-    mkdirSync(dir, { recursive: true });
-  }
-
-  // S3-R4: seed the prior conversation (prefix before the selected request).
-  const requestsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "model_requests.jsonl");
-  const requests = readJsonl<RequestRecord>(requestsPath);
-  const primary = requests.find((r) => r.classification === "task-new-turn" || r.classification === "task-continuation")!;
-  const turnInput = selectedTurnInput(primary.body);
-  const prompt = turnInput.prompt;
   const priorContext = JSON.parse(
     readFileSync(join(checkpointDir(options.storeRoot, options.checkpointId), "prior_context.json"), "utf8"),
   ) as { priorMessages: never[] };
@@ -291,14 +347,13 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   const projectId = openCodeProjectId !== undefined && openCodeProjectId !== "" ? openCodeProjectId : createHash("sha1").update(options.workspacePath).digest("hex");
 
   const seedPlan = planSeed({
-    priorMessages: priorContext.priorMessages,
+    priorMessages: (compactionHistory ?? priorContext.priorMessages) as never[],
     sessionId: capturedSessionId,
     projectId,
     directory: options.workspacePath,
     opencodeVersion: selection.opencodeVersion,
     title: "restore",
     modelId: selection.model,
-    compaction: turnInput.compaction,
     baseTime,
   });
   const sqlPath = join(options.outputDir, "seed.sql");
@@ -351,7 +406,6 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     restoreWorkspacePath: options.workspacePath,
     capturedTmpPath: tmpPrefix(selection.capturedWorkspaceRoot),
     restoreTmpPath: options.tmpPath,
-    compaction: turnInput.compaction !== undefined ? { prompt: turnInput.prompt } : undefined,
   });
   writeFileSync(
     join(options.outputDir, "comparison.json"),
