@@ -10,13 +10,15 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run --exclude 'tests/e2e/**' --exclude 'tests/live/**' --exclude 'tests/restore-e2e/**'",
-    "test:e2e": "vitest run tests/e2e",
+    "test:e2e": "vitest run tests/e2e --exclude 'tests/e2e/package.e2e.test.ts'",
+    "test:package-e2e": "npm run -s build && vitest run tests/e2e/package.e2e.test.ts",
     "test:restore-e2e": "npm run -s build && vitest run tests/restore-e2e",
     "test:watch": "vitest",
     "build": "tsc -p tsconfig.build.json",
     "verify": "npm run typecheck && npm run test && npm run test:e2e",
     "test:live": "set -a && source .env && set +a && npm run verify && vitest run tests/live",
-    "restore": "npm run -s build && node dist/restore/cli.js"
+    "restore": "npm run -s build && node dist/restore/cli.js",
+    "package": "npm run -s build && node dist/package/cli.js"
   },
   "devDependencies": {
     "@types/node": "~22.12.0",
