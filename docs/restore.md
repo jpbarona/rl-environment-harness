@@ -24,9 +24,11 @@ Additional flags: `--timeout-ms <ms>` (default 180000) bounds the OpenCode inter
 3. **Tree comparison (S3-R2).** The actual tree in the container is compared against the manifest: paths, kinds, bytes, file permissions, and symlink targets. Differences fail the run.
 4. **Git reconstruction.** Capture excludes `.git` contents, so the workspace is re-initialized as a git repository to restore the captured VCS state (`Is directory a git repo: yes`).
 5. **Session seeding (S3-R4).** A bootstrap OpenCode run initializes a fresh session store; the prior conversation from `prior_context.json` is inserted as OpenCode session rows via sqlite3. The selected turn is submitted once with `opencode run --session <captured-session-id> "<selected prompt>"`. The bootstrap run is only a store initializer: it points the workspace plugin at a dead loopback port so it fails in under a second, and its own request is never compared or forwarded.
-6. **Interception (S3-R4).** The restore proxy answers every model request locally with a canned completion. The first regenerated primary request is captured before it would be forwarded. **Outbound model requests: zero.**
-7. **Request comparison (S3-R4).** The regenerated request is compared against the captured primary request under the policy below.
-8. **Reports (S3-R7).** `result.json` lists every check; `comparison.json` holds the workspace and request comparisons; `runtime.json` records image digest, versions, and the harness revision.
+6. **Compacted context (S3-R4).** When the selected request's last user message is a compaction checkpoint wrapper, the seeder writes a `compaction` session row carrying the wrapper's summary and recent-context sections (parsed from the captured request) instead of ordinary history rows. OpenCode rebuilds the provider wrapper from those fields, so the regenerated request matches under the declared policy.
+7. **Referenced artifacts (S3-R4).** Files referenced by truncated tool outputs are materialized from the object store into the container at the mapped path (capture home prefix → container home), hash-verified after the copy (`artifacts.materialized` check). Referenced paths inside the restored conversation remain the original capture-time paths, so the provider request matches verbatim; the proxy maps request-time artifact reads through the same declared mapping and fails closed on anything outside it.
+8. **Interception (S3-R4).** The restore proxy answers every model request locally with a canned completion. The first regenerated primary request is captured before it would be forwarded. **Outbound model requests: zero.**
+9. **Request comparison (S3-R4).** The regenerated request is compared against the captured primary request under the policy below.
+10. **Reports (S3-R7).** `result.json` lists every check; `comparison.json` holds the workspace and request comparisons; `runtime.json` records image digest, versions, and the harness revision.
 
 ## Inclusion policy (S3-R2)
 
@@ -42,7 +44,7 @@ Recorded in `containers/restore/lock.json` and baked into the image:
 
 - Base image: `node:22-bookworm-slim` pinned by digest `sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392`, platform `linux/arm64`.
 - OpenCode: `v2.0.18` Linux ARM64 build from `https://opencode.ai/files/bin/2.0.18/opencode-linux-arm64.tar.gz`, pinned by SHA-256 `f46253f0ff5eff0c1751d3b734ede55cc60d932d60af81d061d03745f9998082`. The macOS host binary is never copied into Linux.
-- Tools resolved from the pinned base: Node.js, sqlite3, git — exact strings are baked into the image at build (`/usr/local/share/harness-*-version`) and re-recorded in `runtime.json` per run.
+- Tools: every apt dependency is pinned to an exact version and resolved from one frozen Debian snapshot over HTTPS (`https://snapshot.debian.org/archive/debian/20261008T000000Z`, bookworm main): `git 1:2.39.5-0+deb12u3`, `git-man 1:2.39.5-0+deb12u3`, `sqlite3 3.40.1-2+deb12u2`, `libsqlite3-0 3.40.1-2+deb12u2`, `ca-certificates 20230311+deb12u1`, `openssl 3.0.20-1~deb12u2`, `libssl3 3.0.20-1~deb12u2`. The base image ships no CA bundle, so the pinned `ca-certificates` .deb is vendored in the build context (sha256 recorded in `lock.json`) and extracted before any apt traffic; a version drift fails the build. Node.js comes from the digest-pinned base. Resolved strings are baked into the image (`/usr/local/share/harness-*-version`) and re-recorded in `runtime.json` per run.
 - Deterministic probe: each e2e run performs a read/write/read/delete cycle in the container's private workspace before restoration.
 
 ## Request comparison policy (S3-R4)
@@ -55,6 +57,7 @@ Everything is compared exactly: model id, ordered messages and their content, to
 | `system.platform` | The capture host is macOS; the restore runtime is Linux. | `Platform: darwin` becomes `Platform: linux`, inside the first system message only. |
 | `system.date` | The env block states the current date, which advances between capture and restore. | The `Today's date:` line is neutralized on both sides. |
 | `tools.shell.platform` | The shell tool description states the runtime OS and shell. | The phrase `Commands run on <macOS using zsh / Linux using bash>` is neutralized in the shell tool description only. |
+| `compaction.replay-prompt` | For compacted turns the original request carries the pending prompt inside the checkpoint wrapper; the replay submits it through the CLI, which appends it as one extra user message after the unchanged wrapper. | The wrapper is compared exactly; the appended message must equal the selected prompt byte-for-byte and is recorded as a declared transform. |
 
 Other declared non-comparisons: OpenCode-internal session fields (message ids, timestamps, token counters, agent labels) never reach the provider request and are not compared. The selected prompt must occur exactly once, and its own response and tool suffix must be absent from the captured prefix (`prior_context.json` never contains them).
 

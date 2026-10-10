@@ -10,7 +10,7 @@
 import { RestoreError } from "./select.js";
 
 export interface SeedMessageRow {
-  readonly type: "user" | "assistant" | "idle";
+  readonly type: "user" | "assistant" | "idle" | "compaction";
   readonly id: string;
   readonly seq: number;
   readonly timeCreated: number;
@@ -49,6 +49,8 @@ export interface SeedInput {
   readonly title: string;
   /** Model id recorded on assistant messages. */
   readonly modelId: string;
+  /** Present when the selected turn's context was compacted. */
+  readonly compaction?: { readonly summary: string; readonly recent: string } | undefined;
   /** Base epoch ms for internal timestamps (from runtime capturedAt). */
   readonly baseTime: number;
 }
@@ -62,6 +64,44 @@ export function planSeed(input: SeedInput): SeedPlan {
   let nextId = 1;
   const messageId = () => `msg_restore_${String(nextId++).padStart(4, "0")}`;
   const t = (offset: number) => input.baseTime + offset;
+
+  // Compacted context: the checkpoint message replaces the whole history.
+  // OpenCode rebuilds the provider wrapper from the summary and recent
+  // fields, so the seed must mirror the captured compaction record.
+  if (input.compaction !== undefined) {
+    rows.push({
+      type: "compaction",
+      id: messageId(),
+      seq: seq++,
+      timeCreated: t(0),
+      data: {
+        time: { created: t(0) },
+        status: "completed",
+        reason: "auto",
+        model: { id: input.modelId, providerID: "capture-mock" },
+        summary: input.compaction.summary,
+        recent: input.compaction.recent,
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    });
+    rows.push({
+      type: "idle",
+      id: messageId(),
+      seq: seq++,
+      timeCreated: t(300),
+      data: { time: { created: t(300) }, outcome: "succeeded" },
+    });
+    return {
+      sessionId: input.sessionId,
+      projectId: input.projectId,
+      directory: input.directory,
+      version: input.opencodeVersion,
+      title: input.title,
+      timeCreated: input.baseTime,
+      rows,
+    };
+  }
 
   const toolResults = new Map<string, string>();
   for (const m of input.priorMessages) {

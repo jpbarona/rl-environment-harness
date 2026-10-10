@@ -602,3 +602,39 @@ All six requirements have passing evidence at the current revision; type checkin
 - Restore targets linux/arm64 (the host is Apple Silicon); an x64 lock is a backlog item.
 - The live-model smoke test belongs to Step 5; this step intercepts before forwarding by design.
 - OpenCode-internal fields (message ids, timestamps, token counters, agent labels) are inert in the seed and never compared; the comparison target is the provider request only.
+
+## Entry 019 — Step 3 gap closure: settings comparison, compaction/truncation restore, mutation isolation, pinned deps
+
+**Author:** OpenCode implementing agent. **Date:** 2026-10-10, America/New_York. **Branch:** `step-3`. **Revision:** working tree, uncommitted at entry time. **Image:** `rl-restore:2.0.18` id `sha256:8c723a9b920f0954b6a017194a94951d75de57a1dad4b801e7422118bd3daa84`.
+
+### Gap 1 — S3-R4 settings comparison (closed)
+
+- The comparator previously checked a fixed key list; a changed `max_tokens` passed. It now compares EVERY body key except `messages` and `tools` (those have dedicated comparisons); a key present on only one side is a difference. [Citation: `src/restore/request-compare.ts` settings loop.]
+- New unit negatives: changed `max_tokens` fails (`settings.max_tokens`), an extra regenerated setting fails (`settings.seed`), a missing original setting fails (`settings.temperature`), identical extra settings pass. [Citation: `tests/restore/context.test.ts`.]
+
+### Gap 2 — S3-R4 context cases (closed; two restoration defects found and fixed)
+
+- **Compaction:** the selected request's last user message is a compaction checkpoint wrapper — the pending prompt is INSIDE it (`recent-context`), so `prior_context.json` legitimately excludes it. Initial defect: the worker submitted the wrapper text as the prompt (double quoting) and the seed lacked the summary. Fix: `selectedTurnInput` parses the wrapper (summary + recent) and the seeder writes a `compaction` session row (`status/reason/model/summary/recent`); OpenCode rebuilds the wrapper identically. The replay submits the pending prompt through the CLI, appending it as one extra user message — declared as `compaction.replay-prompt` in the comparison policy: the wrapper must match byte-for-byte and the appended message must equal the selected prompt exactly. [Citation: `tests/restore-e2e/restore.e2e.test.ts` S3-R4 compacted context, PASS; evidence `run-compaction/comparison.json` shows ok:true with 5 declared transforms.]
+- **Truncation:** the seeded tool output references the capture-host artifact path; the plugin reported it and the proxy could not read it, sealing the turn. Fix: the worker materializes referenced artifacts from the object store into the container at the mapped path (capture home → container home), hash-verified after the copy (`artifacts.materialized` check), and the proxy maps artifact reads through the same declared mapping, failing closed otherwise. The provider request keeps the original paths verbatim. [Citation: S3-R4 truncated tool-output reference test, PASS; evidence `run-truncation` shows `artifacts.materialized` with sha256-equal mappings and a matching request comparison.]
+
+### Gap 3 — S3-R5 isolation (closed)
+
+- New mutation-isolation test: restore A runs with `--mutate-after-compare` (worker mutates the workspace after all checks pass), then restore B runs normally. Verified: B passes workspace-tree and request comparisons; the store's file set and hashes are unchanged after both runs; the original capture workspace's file hashes are unchanged; each run seeds its own session store. [Citation: S3-R5 mutation isolation test, PASS; prior repeated-restoration test retained, PASS.]
+
+### Gap 4 — S3-R3 dependency pinning (closed)
+
+- Every apt package is pinned to an exact version resolved from one frozen Debian snapshot over HTTPS (`https://snapshot.debian.org/archive/debian/20261008T000000Z`): git 1:2.39.5-0+deb12u3, git-man 1:2.39.5-0+deb12u3, sqlite3 3.40.1-2+deb12u2, libsqlite3-0 3.40.1-2+deb12u2, ca-certificates 20230311+deb12u1, openssl 3.0.20-1~deb12u2, libssl3 3.0.20-1~deb12u2. The base image ships no CA bundle, so the pinned ca-certificates .deb is vendored in the build context (sha256 `0d5f444f...bed` in `lock.json`) and extracted before any apt traffic; the OpenCode tarball is fetched with node (no curl). A version drift fails the build. [Citation: `containers/restore/Dockerfile`, `containers/restore/lock.json`; rebuilt image verified with dpkg-query inside the container.]
+
+### Verification (commands and results)
+
+1. `npm run typecheck` — exit 0.
+2. `npm run test` — 65 passed (includes new comparator/seeder negatives).
+3. `npm run test:e2e` — 5 passed (real OpenCode capture suite).
+4. `npx vitest run tests/restore-e2e` — 12 passed (real container, real OpenCode v2.0.18): pinned-runtime probe; ordinary two-turn restore; repeated restoration; mutation isolation; 6 negative fixtures; compacted-context restore; truncated-artifact restore. No leaked containers; zero outbound inference in every passing restore.
+- Evidence roots: capture fixtures `work/e2e/restore-fixture-*`, `work/e2e/restore-compaction-*`, `work/e2e/restore-truncation-*`; per-run reports under the suite scratch dirs (`result.json`, `comparison.json`, `regenerated-request.json`, `runtime.json`, `seed.sql`, `trace.jsonl`).
+
+### Limitations
+
+- The comparator transforms only the declared volatile fields; a compaction summary containing capture-host paths would require an additional declared mapping (backlog; the deterministic mock summary contains none).
+- The declared `compaction.replay-prompt` structural difference is documented in docs/restore.md's policy table; the wrapper itself is compared exactly.
+- Restore targets linux/arm64 (host is Apple Silicon); an x64 lock is a backlog item.

@@ -32,6 +32,8 @@ export interface RequestCompareInput {
   readonly capturedTmpPath?: string;
   /** Container tmp path. */
   readonly restoreTmpPath?: string;
+  /** Present when the selected turn's context was compacted. */
+  readonly compaction?: { readonly prompt: string } | undefined;
 }
 
 interface Message {
@@ -80,9 +82,23 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
   if (original["model"] !== regenerated["model"]) {
     add("model", original["model"], regenerated["model"]);
   }
-  for (const key of ["stream", "stream_options", "store", "temperature", "top_p", "tool_choice"] as const) {
-    if (JSON.stringify(original[key]) !== JSON.stringify(regenerated[key])) {
-      add(key, original[key], regenerated[key]);
+  // All model-request settings must match exactly. Only messages and tools
+  // get dedicated comparisons (below); every other key — including limits
+  // like max_tokens and any provider-specific option — is compared as a
+  // setting. A key present on only one side is a difference.
+  const settingsA = new Set(Object.keys(original).filter((k) => k !== "messages" && k !== "tools"));
+  const settingsB = new Set(Object.keys(regenerated).filter((k) => k !== "messages" && k !== "tools"));
+  const onlyA = [...settingsA].filter((k) => !settingsB.has(k));
+  const onlyB = [...settingsB].filter((k) => !settingsA.has(k));
+  for (const key of onlyA) {
+    add(`settings.${key}`, original[key], undefined);
+  }
+  for (const key of onlyB) {
+    add(`settings.${key}`, undefined, regenerated[key]);
+  }
+  for (const key of settingsA) {
+    if (settingsB.has(key) && JSON.stringify(original[key]) !== JSON.stringify(regenerated[key])) {
+      add(`settings.${key}`, original[key], regenerated[key]);
     }
   }
   // Tool schemas: the shell tool's description states the runtime OS and
@@ -113,9 +129,18 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
   }
 
   if (origMessages.length !== regenMessages.length) {
-    add("messages.length", origMessages.length, regenMessages.length);
-  } else {
-    for (let i = 0; i < origMessages.length; i += 1) {
+    // Compacted-turn replay: the replay mechanism submits the pending
+    // prompt through the CLI, which appends it as one extra user message
+    // after the unchanged checkpoint wrapper. Anything else is a failure.
+    const expectedReplayLength = input.compaction !== undefined ? origMessages.length + 1 : origMessages.length;
+    if (regenMessages.length !== expectedReplayLength) {
+      add("messages.length", expectedReplayLength, regenMessages.length);
+    }
+  } else if (input.compaction !== undefined) {
+    add("messages.length", origMessages.length, `${origMessages.length} (replay expects +1)`);
+  }
+  const common = Math.min(origMessages.length, regenMessages.length);
+  for (let i = 0; i < common; i += 1) {
       const o = origMessages[i]!;
       const r = regenMessages[i]!;
       if (o.role !== r.role) {
@@ -155,7 +180,6 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
             detail: "date line neutralized on both sides",
           });
         }
-        mapped = neutralizeRuntime(mapped);
         const rcNeutral = dateLine(neutralizeRuntime(rc));
         if (mapped !== rcNeutral) {
           const at = firstDifferenceIndex(mapped, rcNeutral);
@@ -170,6 +194,18 @@ export function compareRequests(input: RequestCompareInput): RequestComparison {
       if (JSON.stringify(o) !== JSON.stringify(r)) {
         add(`messages[${i}]`, o, r);
       }
+  }
+  if (input.compaction !== undefined && regenMessages.length === origMessages.length + 1) {
+    // The replay-appended prompt must equal the selected turn's argv text.
+    const extra = regenMessages[regenMessages.length - 1]!;
+    const expectedExtra = { role: "user", content: JSON.stringify(input.compaction.prompt) };
+    declared.push({
+      field: "compaction.replay-prompt",
+      reason: "the replay submits the pending prompt through the OpenCode CLI, which appends it as a new user message after the unchanged compaction wrapper (the original turn carried it inside the wrapper)",
+      detail: `appended message must equal ${JSON.stringify(expectedExtra.content).slice(0, 80)}`,
+    });
+    if (JSON.stringify(extra) !== JSON.stringify(expectedExtra)) {
+      add("messages.replay-prompt", expectedExtra, extra);
     }
   }
 
@@ -187,26 +223,64 @@ function firstDifferenceIndex(a: string, b: string): number {
 }
 
 /** Extract the selected prompt: the last user message of the primary request. */
-export function selectedPrompt(requestBody: Record<string, unknown>): string {
+export interface SelectedTurnInput {
+  /** The original argv text of the selected user request. */
+  readonly prompt: string;
+  /** Present when the turn's context was compacted: the checkpoint summary
+   * and the recent-context line OpenCode rendered into the wrapper. */
+  readonly compaction?: { readonly summary: string; readonly recent: string };
+}
+
+/**
+ * Extract the selected turn's input from the primary request. Two shapes:
+ * an ordinary user message (possibly JSON-stringified by OpenCode), or a
+ * compaction checkpoint wrapper whose <recent-context> carries the actual
+ * pending prompt.
+ */
+export function selectedTurnInput(requestBody: Record<string, unknown>): SelectedTurnInput {
   const messages = (requestBody["messages"] ?? []) as Message[];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i]!;
-    if (m.role === "user") {
-      if (typeof m.content === "string") {
-        // OpenCode stores the prompt as JSON.stringify(argv text); the
-        // selected request replays the original argv text.
-        try {
-          const parsed = JSON.parse(m.content);
-          if (typeof parsed === "string") {
-            return parsed;
-          }
-        } catch {
-          // Not a JSON string literal; submit as-is.
-        }
-        return m.content;
-      }
+    if (m.role !== "user") {
+      continue;
+    }
+    if (typeof m.content !== "string") {
       throw new RestoreError("selection.prompt-shape", "selected user message content is not a string");
     }
+    const content = m.content;
+    if (content.includes("<conversation-checkpoint>")) {
+      const summaryStart = content.indexOf("<summary>\n") + "<summary>\n".length;
+      const summaryEnd = content.indexOf("</summary>");
+      const recentStart = content.indexOf("<recent-context>\n") + "<recent-context>\n".length;
+      const recentEnd = content.indexOf("</recent-context>");
+      if (summaryStart < "<summary>\n".length || summaryEnd < 0 || recentEnd < 0) {
+        throw new RestoreError("selection.checkpoint-wrapper-shape", "compaction wrapper lacks summary/recent sections");
+      }
+      const summary = content.slice(summaryStart, summaryEnd).replace(/\n$/, "");
+      const recent = content.slice(recentStart, recentEnd).replace(/\n$/, "");
+      const quoted = recent.replace(/^\[User\]: /, "");
+      let prompt: string;
+      try {
+        const parsed = JSON.parse(quoted);
+        if (typeof parsed !== "string") {
+          throw new Error("not a string");
+        }
+        prompt = parsed;
+      } catch {
+        throw new RestoreError("selection.recent-prompt-shape", `recent context is not a JSON prompt: ${quoted.slice(0, 80)}`);
+      }
+      return { prompt, compaction: { summary, recent } };
+    }
+    // Ordinary prompt: OpenCode stores the argv text JSON-stringified.
+    try {
+      const parsed = JSON.parse(content);
+      if (typeof parsed === "string") {
+        return { prompt: parsed };
+      }
+    } catch {
+      // Not a JSON string literal; submit as-is.
+    }
+    return { prompt: content };
   }
   throw new RestoreError("selection.prompt-missing", "primary request has no user message");
 }

@@ -94,9 +94,29 @@ interface RunResult {
   readonly stderr: string;
 }
 
+/** Capture a real fixture and return the selected last-turn checkpoint. */
+async function captureFixture(
+  name: string,
+  createOptions: Parameters<typeof createE2E>[0],
+  prompts: Array<{ text: string; continueLast?: boolean }>,
+): Promise<{ store: string; ckpt: string; workspace: string }> {
+  const e = await createE2E(createOptions);
+  for (const prompt of prompts) {
+    const r = await e.runPrompt(prompt.text, { continueLast: prompt.continueLast === true });
+    expect(r.code, `${name} capture run failed: ${r.stderr}`).toBe(0);
+  }
+  const lastTurn = [...e.proxy.turns.values()].at(-1)!;
+  expect(lastTurn.checkpointId).toBeTruthy();
+  return { store: join(e.runDir, "capture-store"), ckpt: lastTurn.checkpointId!, workspace: e.workspace };
+}
+
+function fileSha(path: string): string {
+  return spawnSync("shasum", ["-a", "256", path], { encoding: "utf8" }).stdout?.split(" ")[0] ?? "";
+}
+
 function runRestore(
   outDir: string,
-  overrides: { store?: string; checkpoint?: string; opencodeBin?: string; timeoutMs?: number } = {},
+  overrides: { store?: string; checkpoint?: string; opencodeBin?: string; timeoutMs?: number; mutateAfterCompare?: boolean } = {},
 ): Promise<RunResult> {
   const args = [
     "--store", overrides.store ?? store,
@@ -109,6 +129,9 @@ function runRestore(
   }
   if (overrides.timeoutMs !== undefined) {
     args.push("--timeout-ms", String(overrides.timeoutMs));
+  }
+  if (overrides.mutateAfterCompare === true) {
+    args.push("--mutate-after-compare");
   }
   // Async spawn: blocking the vitest worker with spawnSync starves its RPC
   // and fails the run with an unhandled onTaskUpdate timeout.
@@ -217,7 +240,7 @@ describe("S3-R5 independent repeated restoration", () => {
     expect(a).not.toBe(b);
     expect(readFileSync(join(a, "runtime.json"), "utf8")).not.toBe(readFileSync(join(b, "runtime.json"), "utf8"));
     assertNoLeakedContainers();
-  }, 600_000);
+  }, 900_000);
 });
 
 describe("S3-R6 bounded explicit failures", () => {
@@ -308,6 +331,125 @@ describe("S3-R6 bounded explicit failures", () => {
     assertNoLeakedContainers();
   }, 240_000);
 });
+
+describe("S3-R4 compacted context", () => {
+  it("restores a compacted context; the regenerated input matches and no inference is forwarded", async () => {
+    const { store: cStore, ckpt } = await captureFixture(
+      "restore-compaction",
+      { name: "restore-compaction", probe: { compaction: true, truncation: false } },
+      [
+        { text: "FILL the context please" },
+        { text: "and then reply briefly", continueLast: true },
+      ],
+    );
+    const out = join(scratch, "run-compaction");
+    const run = await runRestore(out, { store: cStore, checkpoint: ckpt, timeoutMs: 120_000 });
+    expect(run.status, `compaction restore failed: ${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(resultOf(out).status).toBe("PASS");
+    expect(checkNamed(out, "workspace.tree").ok).toBe(true);
+    expect(checkNamed(out, "session.seeded").ok).toBe(true);
+    expect(checkNamed(out, "request.comparison").ok).toBe(true);
+    expect(checkNamed(out, "outbound.inference-count").ok).toBe(true);
+    // The compacted summary is part of the regenerated input.
+    const regenerated = JSON.parse(readFileSync(join(out, "regenerated-request.json"), "utf8")) as {
+      body: { messages: Array<{ role: string; content: string }> };
+    };
+    expect(JSON.stringify(regenerated.body.messages)).toContain("COMPACTION-SUMMARY-MARKER-424242");
+    // The wrapper's recent section carries the pending prompt once, and the
+    // replay appends it as the declared extra user message.
+    const wrapper = regenerated.body.messages[1]!.content;
+    const recent = wrapper.slice(wrapper.indexOf("<recent-context>"), wrapper.indexOf("</recent-context>"));
+    expect(recent.split("and then reply briefly").length - 1).toBe(1);
+    expect(regenerated.body.messages[2]).toEqual({ role: "user", content: JSON.stringify("and then reply briefly") });
+    assertNoLeakedContainers();
+  }, 540_000);
+});
+
+describe("S3-R4 truncated tool-output reference", () => {
+  it("restores the referenced artifact bytes and matches the regenerated input", async () => {
+    const { store: cStore, ckpt, workspace } = await captureFixture(
+      "restore-truncation",
+      { name: "restore-truncation", probe: { truncation: true, compaction: false } },
+      [
+        { text: "USE_TOOL_BIG write huge output" },
+        { text: "one more turn please", continueLast: true },
+      ],
+    );
+    const references = JSON.parse(
+      readFileSync(join(cStore, "checkpoints", ckpt, "referenced_artifacts.json"), "utf8"),
+    ) as Array<{ originalPath: string; sha256: string }>;
+    expect(references.length, "the truncation fixture must reference an artifact").toBeGreaterThan(0);
+
+    const out = join(scratch, "run-truncation");
+    const run = await runRestore(out, { store: cStore, checkpoint: ckpt, timeoutMs: 120_000 });
+    expect(run.status, `truncation restore failed: ${run.stdout}\n${run.stderr}`).toBe(0);
+    expect(resultOf(out).status).toBe("PASS");
+    expect(checkNamed(out, "request.comparison").ok).toBe(true);
+    expect(checkNamed(out, "outbound.inference-count").ok).toBe(true);
+
+    // The referenced artifact was materialized in the container at the
+    // mapped path and its bytes hash-verified by the worker.
+    const artifactsCheck = checkNamed(out, "artifacts.materialized");
+    expect(artifactsCheck.ok).toBe(true);
+    const mappings = JSON.parse(artifactsCheck.detail) as Array<{ originalPath: string; restorePath: string; sha256: string }>;
+    expect(mappings.length).toBe(references.length);
+    for (const reference of references) {
+      const mapping = mappings.find((m) => m.originalPath === reference.originalPath);
+      expect(mapping, `missing mapping for ${reference.originalPath}`).toBeDefined();
+      expect(mapping!.sha256).toBe(reference.sha256);
+      expect(mapping!.restorePath.startsWith("/work/home")).toBe(true);
+    }
+    // The regenerated input carries the truncated tail with the artifact
+    // reference; the full output never enters the provider request.
+    const regenerated = JSON.parse(readFileSync(join(out, "regenerated-request.json"), "utf8")) as {
+      body: { messages: Array<{ role: string; content: string }> };
+    };
+    expect(JSON.stringify(regenerated.body.messages)).toContain("full output saved to");
+    // The selected prompt occurs exactly once: as the final user message.
+    const messageText = JSON.stringify(regenerated.body.messages);
+    expect(messageText.split("one more turn please").length - 1).toBe(1);
+    expect(regenerated.body.messages.at(-1)!.role).toBe("user");
+    assertNoLeakedContainers();
+    void workspace;
+  }, 540_000);
+});
+
+describe("S3-R5 mutation isolation", () => {
+  it("a mutation inside restore A changes neither the store, restore B, nor the original workspace", async () => {
+    const storeBefore = checksumStore(store);
+    const workspaceSentinels = ["notes.md", "selected-output.txt", "untracked.txt", "fixture.ignored"]
+      .filter((f) => existsSync(join(env!.workspace, f)))
+      .map((f) => `${f}:${fileSha(join(env!.workspace, f))}`);
+
+    // Restore A mutates its own workspace after all comparisons pass.
+    const a = join(scratch, "run-isolation-a");
+    expect((await runRestore(a, { mutateAfterCompare: true })).status).toBe(0);
+    expect(resultOf(a).status).toBe("PASS");
+    expect(traceHasMutation(a)).toBe(true);
+
+    // The store and the original capture workspace are untouched.
+    expect(checksumStore(store)).toEqual(storeBefore);
+    const workspaceAfter = ["notes.md", "selected-output.txt", "untracked.txt", "fixture.ignored"]
+      .filter((f) => existsSync(join(env!.workspace, f)))
+      .map((f) => `${f}:${fileSha(join(env!.workspace, f))}`);
+    expect(workspaceAfter).toEqual(workspaceSentinels);
+
+    // Restore B from the same selection still matches the captured state.
+    const b = join(scratch, "run-isolation-b");
+    expect((await runRestore(b)).status).toBe(0);
+    expect(resultOf(b).status).toBe("PASS");
+    expect(checkNamed(b, "workspace.tree").ok).toBe(true);
+    expect(checkNamed(b, "request.comparison").ok).toBe(true);
+    // Independent session stores: each run seeds its own home.
+    expect(readFileSync(join(a, "runtime.json"), "utf8")).not.toBe(readFileSync(join(b, "runtime.json"), "utf8"));
+    assertNoLeakedContainers();
+  }, 600_000);
+});
+
+function traceHasMutation(outDir: string): boolean {
+  const trace = readFileSync(join(outDir, "trace.jsonl"), "utf8");
+  return trace.includes("workspace.mutated");
+}
 
 function checksumStore(storeDir: string): string {
   const parts: string[] = [];

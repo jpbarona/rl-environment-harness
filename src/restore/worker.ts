@@ -11,13 +11,14 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { RestoreError, verifyObject } from "./select.js";
 import { EventTrace } from "../capture/trace.js";
 import { CaptureProxy } from "../capture/proxy.js";
 import { checkpointDir, readManifest, selectCheckpoint } from "./select.js";
 import { INCLUSION_POLICY, materializeWorkspace } from "./materialize.js";
 import { compareTree } from "./compare.js";
-import { compareRequests, selectedPrompt } from "./request-compare.js";
+import { compareRequests, selectedTurnInput } from "./request-compare.js";
 import { planSeed, renderSeedSql } from "./context-seed.js";
 
 export interface WorkerOptions {
@@ -34,6 +35,8 @@ export interface WorkerOptions {
   readonly opencodeLockSha256: string;
   readonly harnessRevision: string;
   readonly timeoutMs: number;
+  /** S3-R5 test hook: mutate the workspace after all comparisons pass. */
+  readonly mutateAfterCompare?: boolean;
 }
 
 interface RequestRecord {
@@ -111,6 +114,10 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   }
 
   // Start the interception proxy: every model request is answered locally.
+  // Artifact references name paths inside the capture host's home; the
+  // rewrite maps them to the materialized container copies (fail closed
+  // for anything else).
+  const captureHomePrefix = join(selection.capturedWorkspaceRoot, "..", "home");
   let interceptedBody: string | null = null;
   let interceptedRecord: { classification: string; index: number } | null = null;
   let armed = false;
@@ -123,6 +130,12 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     artifactRoots: [options.workspacePath, options.homePath],
     interceptRequests: true,
     identityTimeoutMs: 300_000,
+    artifactPathRewrite: (path) => {
+      if (!path.startsWith(captureHomePrefix)) {
+        return undefined;
+      }
+      return options.homePath + path.slice(captureHomePrefix.length);
+    },
     onRequestIntercepted: (body, recorded) => {
       if (armed && interceptedBody === null) {
         interceptedBody = body;
@@ -172,6 +185,32 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   }
   record("workspace.config-rebind", true, runtimeRebinds.length === 0 ? "no runtime-bound references" : runtimeRebinds.map((r) => `${r.original} -> ${r.rebound}`).join("; "));
 
+  // S3-R4: materialize referenced tool-output artifacts at their mapped
+  // paths. The capture recorded each artifact's absolute path (inside the
+  // capture home) and content hash; the same relative suffix is recreated
+  // under the container home so the restored context references a real file.
+  const artifactsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "referenced_artifacts.json");
+  const artifactMappings: Array<{ originalPath: string; restorePath: string; sha256: string }> = [];
+  if (existsSync(artifactsPath)) {
+    const captureHomePrefix = join(selection.capturedWorkspaceRoot, "..", "home");
+    const referenced = JSON.parse(readFileSync(artifactsPath, "utf8")) as Array<{ originalPath: string; sha256: string }>;
+    for (const artifact of referenced) {
+      verifyObject(options.storeRoot, artifact.sha256, `artifact ${artifact.originalPath}`);
+      if (!artifact.originalPath.startsWith(captureHomePrefix)) {
+        throw new RestoreError("artifacts.path-outside-capture-home", artifact.originalPath);
+      }
+      const restorePath = options.homePath + artifact.originalPath.slice(captureHomePrefix.length);
+      mkdirSync(resolve(restorePath, ".."), { recursive: true });
+      copyFileSync(join(options.storeRoot, "objects", artifact.sha256), restorePath);
+      const copied = createHash("sha256").update(readFileSync(restorePath)).digest("hex");
+      if (copied !== artifact.sha256) {
+        throw new RestoreError("artifacts.bytes-mismatch", restorePath);
+      }
+      artifactMappings.push({ originalPath: artifact.originalPath, restorePath, sha256: artifact.sha256 });
+    }
+  }
+  record("artifacts.materialized", true, artifactMappings.length === 0 ? "no referenced artifacts" : JSON.stringify(artifactMappings));
+
   // Fresh private OpenCode session store.
   const xdgData = join(options.homePath, "data");
   const xdgConfig = join(options.homePath, "cfg");
@@ -183,7 +222,8 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
   const requestsPath = join(checkpointDir(options.storeRoot, options.checkpointId), "model_requests.jsonl");
   const requests = readJsonl<RequestRecord>(requestsPath);
   const primary = requests.find((r) => r.classification === "task-new-turn" || r.classification === "task-continuation")!;
-  const prompt = selectedPrompt(primary.body);
+  const turnInput = selectedTurnInput(primary.body);
+  const prompt = turnInput.prompt;
   const priorContext = JSON.parse(
     readFileSync(join(checkpointDir(options.storeRoot, options.checkpointId), "prior_context.json"), "utf8"),
   ) as { priorMessages: never[] };
@@ -258,6 +298,7 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     opencodeVersion: selection.opencodeVersion,
     title: "restore",
     modelId: selection.model,
+    compaction: turnInput.compaction,
     baseTime,
   });
   const sqlPath = join(options.outputDir, "seed.sql");
@@ -310,10 +351,11 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
     restoreWorkspacePath: options.workspacePath,
     capturedTmpPath: tmpPrefix(selection.capturedWorkspaceRoot),
     restoreTmpPath: options.tmpPath,
+    compaction: turnInput.compaction !== undefined ? { prompt: turnInput.prompt } : undefined,
   });
   writeFileSync(
     join(options.outputDir, "comparison.json"),
-    `${JSON.stringify({ workspace: treeComparison, request: requestComparison, runtimeRebinds }, null, 2)}\n`,
+    `${JSON.stringify({ workspace: treeComparison, request: requestComparison, runtimeRebinds, artifacts: artifactMappings }, null, 2)}\n`,
   );
   record(
     "request.comparison",
@@ -346,6 +388,19 @@ export async function runRestoreWorker(options: WorkerOptions): Promise<number> 
 
   const failed = checks.filter((c) => !c.ok);
   void failed;
+  // S3-R5 hook: after all comparisons pass, mutate the restored workspace
+  // inside restore A's own container. Restore B and the read-only store
+  // must be unaffected; the mutation dies with this container.
+  if (options.mutateAfterCompare === true) {
+    const targets = manifest.files.filter((f) => f.kind === "file");
+    const victim = targets[1] ?? targets[0];
+    if (victim !== undefined) {
+      writeFileSync(join(options.workspacePath, victim.path), "MUTATED-BY-RESTORE-A\n");
+      writeFileSync(join(options.workspacePath, "restore-a-extra.txt"), "created-by-A\n");
+      rmSync(join(options.workspacePath, targets[0]?.path ?? victim.path), { force: true });
+      trace.append("workspace.mutated", { after: "comparison" });
+    }
+  }
   return result(checks.every((c) => c.ok) ? "PASS" : "FAIL");
 }
 
@@ -455,6 +510,7 @@ function main(): void {
     opencodeLockSha256: identity.opencodeSha256,
     harnessRevision: identity.harnessRevision,
     timeoutMs: Number(get("--timeout-ms") ?? 180_000),
+    mutateAfterCompare: argv.includes("--mutate-after-compare"),
   }).then((code) => {
     process.exit(code);
   });

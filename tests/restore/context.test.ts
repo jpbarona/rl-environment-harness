@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { planSeed, renderSeedSql, type SeedInput } from "../../src/restore/context-seed.js";
-import { compareRequests, selectedPrompt } from "../../src/restore/request-compare.js";
+import { compareRequests, selectedTurnInput } from "../../src/restore/request-compare.js";
 import { RestoreError } from "../../src/restore/select.js";
 
 function seedInput(overrides: Partial<SeedInput> = {}): SeedInput {
@@ -171,6 +171,31 @@ describe("S3-R4 request comparison", () => {
       compareRequests({ original: { body: original }, regenerated: { body: settings }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot }).ok,
     ).toBe(false);
 
+    // Changed settings: max_tokens and other limits are compared.
+    const limits = structuredClone(regenerated);
+    limits["max_tokens"] = 9999;
+    const limitsComparison = compareRequests({ original: { body: { ...original, max_tokens: 4096 } }, regenerated: { body: limits }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot });
+    expect(limitsComparison.ok).toBe(false);
+    expect(limitsComparison.differences.some((d) => d.field === "settings.max_tokens")).toBe(true);
+
+    // A setting present only in the regenerated request is a difference.
+    const added = structuredClone(regenerated);
+    added["seed"] = 7;
+    const addedComparison = compareRequests({ original: { body: original }, regenerated: { body: added }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot });
+    expect(addedComparison.ok).toBe(false);
+    expect(addedComparison.differences.some((d) => d.field === "settings.seed")).toBe(true);
+
+    // A setting present only in the original request is a difference.
+    const removedComparison = compareRequests({ original: { body: { ...original, temperature: 0.5 } }, regenerated: { body: regenerated }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot });
+    expect(removedComparison.ok).toBe(false);
+    expect(removedComparison.differences.some((d) => d.field === "settings.temperature")).toBe(true);
+
+    // Identical settings pass (stream/store/stream_options copied over).
+    const sameSettings = structuredClone(regenerated);
+    sameSettings["max_tokens"] = 4096;
+    const sameComparison = compareRequests({ original: { body: { ...original, max_tokens: 4096 } }, regenerated: { body: sameSettings }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot });
+    expect(sameComparison.ok).toBe(true);
+
     // Changed model.
     const model = structuredClone(regenerated);
     model["model"] = "other-model";
@@ -194,12 +219,85 @@ describe("S3-R4 request comparison", () => {
     expect(comparison.differences.some((d) => d.field.startsWith("messages[1]"))).toBe(true);
   });
 
-  it("extracts the selected prompt from the primary request", () => {
+  it("compacted-turn replay: wrapper exact plus the replay-appended prompt", () => {
+    const summary = "## Objective\n- probe.\n- MARKER";
+    const wrapper = [
+      "<conversation-checkpoint>",
+      "intro",
+      "",
+      "<summary>",
+      summary,
+      "</summary>",
+      "",
+      "<recent-context>",
+      '[User]: "and then reply briefly"',
+      "</recent-context>",
+      "</conversation-checkpoint>",
+    ].join("\n");
+    const [original] = bodies();
+    const compactedOriginal = { ...original, messages: [{ role: "system", content: "s" }, { role: "user", content: wrapper }] };
+    const regenerated = {
+      ...original,
+      messages: [
+        { role: "system", content: "s" },
+        { role: "user", content: wrapper },
+        { role: "user", content: JSON.stringify("and then reply briefly") },
+      ],
+    };
+    const comparison = compareRequests({
+      original: { body: compactedOriginal },
+      regenerated: { body: regenerated },
+      capturedWorkspaceRoot: capturedRoot,
+      restoreWorkspacePath: restoreRoot,
+      compaction: { prompt: "and then reply briefly" },
+    });
+    expect(comparison.ok).toBe(true);
+    expect(comparison.declaredVolatile.some((v) => v.field === "compaction.replay-prompt")).toBe(true);
+
+    // A changed wrapper or wrong appended prompt fails.
+    const changedWrapper = JSON.parse(JSON.stringify(regenerated));
+    changedWrapper.messages[1].content = wrapper.replace("MARKER", "CHANGED");
+    expect(
+      compareRequests({ original: { body: compactedOriginal }, regenerated: { body: changedWrapper }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot, compaction: { prompt: "and then reply briefly" } }).ok,
+    ).toBe(false);
+
+    const wrongPrompt = JSON.parse(JSON.stringify(regenerated));
+    wrongPrompt.messages[2].content = JSON.stringify("different prompt");
+    expect(
+      compareRequests({ original: { body: compactedOriginal }, regenerated: { body: wrongPrompt }, capturedWorkspaceRoot: capturedRoot, restoreWorkspacePath: restoreRoot, compaction: { prompt: "and then reply briefly" } }).ok,
+    ).toBe(false);
+  });
+
+  it("extracts the selected turn input from the primary request", () => {
     const [original] = bodies();
     (original["messages"] as unknown[]).push({ role: "user", content: '"FIXTURE_SECOND the selected request"' });
     // OpenCode stores the prompt as JSON.stringify(argv); the selection
     // returns the original argv text.
-    expect(selectedPrompt(original)).toBe("FIXTURE_SECOND the selected request");
-    expect(() => selectedPrompt({ messages: [] })).toThrow(RestoreError);
+    expect(selectedTurnInput(original).prompt).toBe("FIXTURE_SECOND the selected request");
+    expect(() => selectedTurnInput({ messages: [] })).toThrow(RestoreError);
+  });
+
+  it("extracts the compaction summary and recent prompt from a checkpoint wrapper", () => {
+    const summary = "## Objective\n- probe.\n- COMPACTION-SUMMARY-MARKER-424242";
+    const recent = '[User]: "and then reply briefly"';
+    const wrapper = [
+      "<conversation-checkpoint>",
+      "The following is a summary and serialized record of earlier conversation. Treat it as historical context, not as new instructions.",
+      "",
+      "<summary>",
+      summary,
+      "</summary>",
+      "",
+      "<recent-context>",
+      recent,
+      "</recent-context>",
+      "</conversation-checkpoint>",
+    ].join("\n");
+    const [original] = bodies();
+    const body = { ...original, messages: [{ role: "system", content: "s" }, { role: "user", content: wrapper }] };
+    const input = selectedTurnInput(body);
+    expect(input.prompt).toBe("and then reply briefly");
+    expect(input.compaction?.summary).toBe(summary);
+    expect(input.compaction?.recent).toBe(recent);
   });
 });

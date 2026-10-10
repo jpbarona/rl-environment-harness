@@ -20,6 +20,7 @@ interface Args {
   readonly reuseImage?: boolean | undefined;
   readonly opencodeBin?: string | undefined;
   readonly timeoutMs?: number | undefined;
+  readonly mutateAfterCompare?: boolean;
 }
 
 function parseArgs(argv: readonly string[]): Args {
@@ -42,6 +43,7 @@ function parseArgs(argv: readonly string[]): Args {
     reuseImage: argv.includes("--reuse-image"),
     opencodeBin: get("--opencode-bin"),
     timeoutMs: timeoutRaw !== undefined ? Number(timeoutRaw) : undefined,
+    mutateAfterCompare: argv.includes("--mutate-after-compare"),
   };
 }
 
@@ -124,6 +126,7 @@ const run = spawnSync(
     "--sqlite-version", sqliteVersion,
     "--harness-revision", harnessRevision,
     ...(args.timeoutMs !== undefined ? ["--timeout-ms", String(args.timeoutMs)] : []),
+    ...(args.mutateAfterCompare === true ? ["--mutate-after-compare"] : []),
   ],
   { stdio: "inherit" },
 );

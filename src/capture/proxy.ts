@@ -101,6 +101,12 @@ export interface CaptureProxyOptions {
   /** Called with each intercepted primary request body (restore mode). */
   readonly onRequestIntercepted?: (body: string, recorded: RecordedRequest) => void;
   /**
+   * Restore mode: map a referenced artifact's capture-host path to its
+   * container path. Return undefined to keep the original path (which then
+   * fails the roots check and seals the turn — fail closed).
+   */
+  readonly artifactPathRewrite?: (path: string) => string | undefined;
+  /**
    * Runtime/configuration references persisted with every checkpoint.
    * Example: { opencodeVersion, configPath, isolatedHome, providerBaseURL }.
    */
@@ -796,12 +802,24 @@ export class CaptureProxy {
   }
 
   /** Capture one referenced artifact into the shared object store. */
+  /** Map a referenced artifact path through the restore rewrite, if any. */
+  #mapArtifactPath(path: string): string {
+    if (this.#options.artifactPathRewrite === undefined) {
+      return path;
+    }
+    return this.#options.artifactPathRewrite(path) ?? path;
+  }
+
   #captureArtifact(turn: TurnRecord, path: string): void {
     const existing = (turn.artifacts ??= []).find(a => a.originalPath === path);
     if (existing !== undefined) {
       return;
     }
-    const source = realpathSync(path);
+    // Restore mode: the referenced path names a file inside the capture
+    // host's home; the rewrite maps it to the container copy. The recorded
+    // originalPath stays verbatim so the checkpoint's reference matches the
+    // captured one.
+    const source = realpathSync(this.#mapArtifactPath(path));
     const permitted = (this.#options.artifactRoots ?? []).some(root => {
       const rel = relative(realpathSync(root), source);
       return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
