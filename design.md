@@ -4,7 +4,7 @@
 
 Create reproducible reinforcement learning (RL) task candidates from model attempts on normal software tasks. OpenCode is the interactive agent. The harness captures state, restores it, packages it, and checks that the agent can run. OpenRouter provides model access.
 
-**Current position:** Steps 1 and 2 are complete. Step 3 is next. Restoration, portable packaging, and the checkpoint command are not yet verified. The agreed boundary is: Step 3 restores and compares; Step 4 packages for portability; Step 5 connects the user command and live attempt.
+**Current position:** Steps 1-4 are complete with passing evidence. Step 5 is next: connect !checkpoint and run a bounded live attempt. The agreed boundary is: Step 3 restores and compares; Step 4 packages for portability; Step 5 connects the user command and live attempt.
 
 The first application is a quality audit of Xiaomi's public MiMo-V2.6 RL task dataset. Capturing that software work can produce additional task candidates. [Dataset](https://huggingface.co/datasets/XiaomiMiMo/MiMo-V2.6-RL-oss)
 
@@ -53,8 +53,8 @@ The MVP covers one idle OpenCode session and one declared coding workspace. Proc
 ```mermaid
 flowchart LR
     A[1 Scaffold: complete] --> B[2 Capture: complete]
-    B --> C[3 Restore files and context]
-    C --> D[4 Portable task package]
+    B --> C[3 Restore files and context: complete]
+    C --> D[4 Portable task package: complete]
     D --> E[5 !checkpoint and live attempt]
     E --> F[6 VM deployment]
 ```
