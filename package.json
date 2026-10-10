@@ -9,11 +9,14 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude 'tests/e2e/**' --exclude 'tests/live/**'",
+    "test": "vitest run --exclude 'tests/e2e/**' --exclude 'tests/live/**' --exclude 'tests/restore-e2e/**'",
     "test:e2e": "vitest run tests/e2e",
+    "test:restore-e2e": "npm run -s build && vitest run tests/restore-e2e",
     "test:watch": "vitest",
+    "build": "tsc -p tsconfig.build.json",
     "verify": "npm run typecheck && npm run test && npm run test:e2e",
-    "test:live": "set -a && source .env && set +a && npm run verify && vitest run tests/live"
+    "test:live": "set -a && source .env && set +a && npm run verify && vitest run tests/live",
+    "restore": "npm run -s build && node dist/restore/cli.js"
   },
   "devDependencies": {
     "@types/node": "~22.12.0",

@@ -1,0 +1,29 @@
+{
+  "name": "rl-restore",
+  "platform": "linux/arm64",
+  "image": "node:22-bookworm-slim",
+  "imageDigest": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+  "tag": "rl-restore",
+  "opencode": {
+    "version": "2.0.18",
+    "url": "https://opencode.ai/files/bin/2.0.18/opencode-linux-arm64.tar.gz",
+    "sha256": "f46253f0ff5eff0c1751d3b734ede55cc60d932d60af81d061d03745f9998082",
+    "binPath": "/usr/local/opencode/opencode"
+  },
+  "aptPackages": {
+    "source": "https://snapshot.debian.org/archive/debian/20261008T000000Z (bookworm main, frozen, HTTPS only)",
+    "caCertBootstrap": {
+      "package": "ca-certificates_20230311+deb12u1_all.deb",
+      "sha256": "0d5f444f594e48c1e16a41d8fc628a09b24c658916a1274025c2330f2a802bed",
+      "note": "vendored in containers/restore/vendor and dpkg-installed before any apt traffic (the base image ships no CA bundle)"
+    },
+    "git": "1:2.39.5-0+deb12u3",
+    "git-man": "1:2.39.5-0+deb12u3",
+    "sqlite3": "3.40.1-2+deb12u2",
+    "libsqlite3-0": "3.40.1-2+deb12u2",
+    "ca-certificates": "20230311+deb12u1",
+    "openssl": "3.0.20-1~deb12u2",
+    "libssl3": "3.0.20-1~deb12u2"
+  },
+  "notes": "Node and its libraries come from the digest-pinned base image. apt packages are installed at exact versions from a frozen Debian snapshot; a version drift fails the build. Resolved strings are baked into the image (harness-*-version files) and re-verified by the worker."
+}

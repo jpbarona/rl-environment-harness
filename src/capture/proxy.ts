@@ -93,6 +93,26 @@ export interface CaptureProxyOptions {
   /** Test hook: delay each artifact capture to prove dependent actions wait. */
   readonly artifactDelayMs?: number;
   /**
+   * Restore mode (Step 3): every model request is answered locally with a
+   * canned completion and NEVER forwarded upstream. The first primary task
+   * request is the regenerated input under comparison.
+   */
+  readonly interceptRequests?: true;
+  /** Called with each intercepted primary request body (restore mode). */
+  readonly onRequestIntercepted?: (body: string, recorded: RecordedRequest) => void;
+  /**
+   * Restore mode: map a referenced artifact's capture-host path to its
+   * container path. Return undefined to keep the original path (which then
+   * fails the roots check and seals the turn — fail closed).
+   */
+  readonly artifactPathRewrite?: (path: string) => string | undefined;
+  /**
+   * Restore mode: the captured compaction summary. A background-compaction
+   * request is answered with this text so real OpenCode rebuilds the same
+   * checkpoint wrapper it produced at capture time.
+   */
+  readonly compactionResponse?: string | undefined;
+  /**
    * Runtime/configuration references persisted with every checkpoint.
    * Example: { opencodeVersion, configPath, isolatedHome, providerBaseURL }.
    */
@@ -189,6 +209,7 @@ export class CaptureProxy {
   async #handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const trace = this.#options.trace;
     try {
+      trace.append("http.received", { method: req.method, url: req.url });
       const body = await readBody(req);
       if (req.url === "/capture-gate" && req.method === "POST") {
         const identity = JSON.parse(body) as { sessionID?: unknown; messageID?: unknown };
@@ -762,6 +783,29 @@ export class CaptureProxy {
     if (turn === undefined || turn.checkpointId === null) {
       return;
     }
+    // The response is an SSE stream; the summary is the concatenated delta
+    // content, not the raw body.
+    let summary = "";
+    for (const line of responseText.split("\n")) {
+      if (!line.startsWith("data: ")) {
+        continue;
+      }
+      const payload = line.slice(6);
+      if (payload.trim() === "[DONE]") {
+        continue;
+      }
+      try {
+        const chunk = JSON.parse(payload) as {
+          choices?: Array<{ delta?: { content?: string } }>;
+        };
+        summary += chunk.choices?.[0]?.delta?.content ?? "";
+      } catch {
+        // Malformed chunk; skip it.
+      }
+    }
+    if (summary.length === 0) {
+      summary = responseText;
+    }
     const dir = join(this.#options.captureStoreDir, "checkpoints", turn.checkpointId);
     mkdirSync(dir, { recursive: true });
     const file = join(dir, "compaction.json");
@@ -777,22 +821,34 @@ export class CaptureProxy {
     } catch {
       // No prior authoritative record; start one.
     }
-    record.summaries.push({ at: new Date().toISOString(), status, summary: responseText });
+    record.summaries.push({ at: new Date().toISOString(), status, summary });
     writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
     this.#options.trace.append("compaction.summary.recorded", {
       turnId,
       status,
-      bytes: responseText.length,
+      bytes: summary.length,
     });
   }
 
   /** Capture one referenced artifact into the shared object store. */
+  /** Map a referenced artifact path through the restore rewrite, if any. */
+  #mapArtifactPath(path: string): string {
+    if (this.#options.artifactPathRewrite === undefined) {
+      return path;
+    }
+    return this.#options.artifactPathRewrite(path) ?? path;
+  }
+
   #captureArtifact(turn: TurnRecord, path: string): void {
     const existing = (turn.artifacts ??= []).find(a => a.originalPath === path);
     if (existing !== undefined) {
       return;
     }
-    const source = realpathSync(path);
+    // Restore mode: the referenced path names a file inside the capture
+    // host's home; the rewrite maps it to the container copy. The recorded
+    // originalPath stays verbatim so the checkpoint's reference matches the
+    // captured one.
+    const source = realpathSync(this.#mapArtifactPath(path));
     const permitted = (this.#options.artifactRoots ?? []).some(root => {
       const rel = relative(realpathSync(root), source);
       return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
@@ -1134,6 +1190,50 @@ export class CaptureProxy {
     onResponse?: (responseText: string, status: number) => void,
   ): Promise<void> {
     const trace = this.#options.trace;
+    // Restore mode: answer locally, never open an upstream connection.
+    if (this.#options.interceptRequests === true) {
+      const model = recorded.model ?? "unknown";
+      // A compaction call is answered with the captured summary so real
+      // OpenCode rebuilds the same checkpoint wrapper it produced at
+      // capture time; everything else gets the generic canned response.
+      const isCompaction = recorded.classification === "background-compaction";
+      const content = isCompaction && this.#options.compactionResponse !== undefined
+        ? this.#options.compactionResponse
+        : "Restore interception: no model executed.";
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      const created = Math.floor(Date.now() / 1000);
+      const id = "restore-intercepted";
+      for (const delta of [
+        { role: "assistant", content },
+        {},
+      ] as const) {
+        const finish = delta.role === undefined ? "stop" : null;
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        })}\n\n`);
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+      trace.append("request.intercepted", {
+        index: recorded.index,
+        classification: recorded.classification,
+        model,
+      });
+      if (
+        this.#options.onRequestIntercepted !== undefined &&
+        (recorded.classification === "task-new-turn" || recorded.classification === "task-continuation")
+      ) {
+        this.#options.onRequestIntercepted(body, recorded);
+      }
+      return;
+    }
     const up = new URL(this.#options.upstreamURL);
     const basePath = up.pathname.replace(/\/[^/]*$/, "");
     // Manual concatenation: URL resolution with an absolute path would drop
