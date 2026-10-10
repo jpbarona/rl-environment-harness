@@ -1,0 +1,15 @@
+{
+  "name": "rl-restore",
+  "platform": "linux/arm64",
+  "image": "node:22-bookworm-slim",
+  "imageDigest": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+  "tag": "rl-restore",
+  "opencode": {
+    "version": "2.0.18",
+    "url": "https://opencode.ai/files/bin/2.0.18/opencode-linux-arm64.tar.gz",
+    "sha256": "f46253f0ff5eff0c1751d3b734ede55cc60d932d60af81d061d03745f9998082",
+    "binPath": "/usr/local/opencode/opencode"
+  },
+  "aptPackages": ["git", "sqlite3", "ca-certificates", "curl"],
+  "notes": "SQLite and git versions resolve from the digest-pinned Debian base; exact strings are baked into the image at build (harness-*-version files) and re-verified by the worker."
+}

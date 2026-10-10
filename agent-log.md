@@ -542,3 +542,63 @@ All six requirements have passing evidence at the current revision; type checkin
 - **User requirement:** The user raised the live-test cap to 0.10 USD. [Citation: user correction “i raised the cap to 0.1”.]
 - **Correction to Entries 015/016:** Their description of the 0.10 USD key limit as an outstanding mismatch is superseded by this authorization. Updated design.md, docs/live-capture-test.md, and docs/step-5-requirements.md to use the 0.10 USD cap. Prior entries remain intact. [Citation: user correction; named documentation files.]
 - **Implementation observation:** The existing key-limit check accepts at most 0.10 USD; the free-model restriction remains present. No code or account configuration was changed in this documentation correction. [Citation: tests/live/capture.live.test.ts keyData.data.limit comparison and eligible model filter; this file-write operation.]
+
+## Entry 017 — Step 3 started: plan and ground truth
+
+**Author:** OpenCode implementing agent. **Date:** 2026-10-09 evening, America/New_York. **Branch:** `step-3` from `origin/main` (70cdea0, tree-identical to the Step 2 tip `31a7926`), per user instruction to abort if `origin/main` did not contain Step 2. [Citation: `git diff origin/main origin/attempt-1` returned empty; squash merge via PR #1.]
+
+- **User authorization:** "green light for step 3, create a new branch step-3 branching from origin/main". [Citation: user message, this session.]
+- **Ground truth established:**
+  - Docker daemon available (Server 28.5.1, Docker Desktop started via `open -a Docker`). [Citation: `docker version` output.]
+  - OpenCode v2.0.18 stores sessions in `$XDG_DATA_HOME/opencode/opencode.db` (SQLite: `session_v2`, `session_message` with full part JSON, `session_inbox`, `project`). [Citation: schema dump from the persisted isolated home in `work/e2e/two-turn-deltas-1791583156681-q29k1z/home/data/opencode/opencode.db` via sqlite3.]
+  - Checkpoint records available for reconstruction: `manifest.json` (paths, kinds file/directory/symlink, mode, size, sha256), `prior_context.json` (provider-form ordered messages), `session_state.json` (session id, project id, empty messages on v2.0.18), `runtime.json` (model, version, workspace root), `model_requests.jsonl` (effective requests), `tool_outputs.jsonl` (evidence), `referenced_artifacts.json`, `compaction.json`/`compaction_requests.jsonl` (when applicable). [Citation: file contents inspected in the run dir above.]
+- **Plan (matches docs/step-3-requirements.md implementation sequence):**
+  1. Host-side selection/preflight, workspace materialization, tree comparator with negative fixtures (S3-R1, S3-R2).
+  2. Pinned Linux runtime: `node:22-bookworm-slim` pinned by digest, pinned Linux OpenCode v2.0.18 download verified by checksum, sqlite3 for DB seeding, deterministic read/write/read/delete probe (S3-R3).
+  3. Context seeding from `prior_context.json` into a fresh OpenCode DB inside the container; restore-mode proxy intercepts the first regenerated primary request and returns a canned response without forwarding; comparison against the original captured request under a checked-in volatile-fields policy (S3-R4).
+  4. Repeated independent restoration, bounded explicit failures, `npm run restore --` CLI with machine-readable `result.json` (S3-R5, S3-R6, S3-R7).
+- **Constraint carried forward:** long commands run in the background; evidence appended here.
+
+## Entry 018 — Step 3 implementation and verification
+
+**Author:** OpenCode implementing agent. **Date:** 2026-10-10, America/New_York. **Branch:** `step-3` (from `origin/main` 70cdea0). **Revision:** working tree, uncommitted at entry time.
+
+### Ground truth established (cited)
+
+- OpenCode v2.0.18 stores sessions in `$XDG_DATA_HOME/opencode/opencode.db` (SQLite: `session_v2`, `session_message` with full part JSON, `session_inbox`, `project`, `event_sequence`). [Citation: schema + row dumps from the persisted isolated home of a real capture run, via sqlite3.]
+- `event_sequence` holds the per-session message seq counter; seeding without it collides on `UNIQUE(session_id, seq)`. [Citation: SQLiteError in the container log, fixed by seeding the counter.]
+- Message records are schema-validated on load; a tool part requires its `time` block, and tool-call turns carry `finish: "tool-calls"` / `rawFinish: "tool_calls"`. [Citation: `Session.MessageDecodeError` in the container log, fixed by mirroring the captured shapes.]
+- `createE2E` writes the provider config INTO the workspace (`opencode.json` at the workspace root) with the capture run's proxy port; project config overrides the global config, so the restore provider call targeted the dead capture port (51231) and got `ConnectionRefused`. [Citation: strace of the opencode server in the container showing connects to 127.0.0.1:51231; fixed by the S3-R4 rebind after tree comparison.]
+- The workspace plugin resolves `CAPTURE_SERVICE_URL`; an unset or dead service fails the prompt hook (`fetch() URL is invalid` / `Unable to connect`) and fails the run. [Citation: opencode log; the bootstrap therefore points the plugin at a dead loopback port intentionally (fast store init), and the selected run points it at the live restore proxy.]
+
+### Implementation (files)
+
+- `src/restore/select.ts` — S3-R1 selection + preflight (identity from records, no prompt-text inference, conflicting expected identity rejected, object hash verification).
+- `src/restore/materialize.ts` — S3-R2 materialization (path safety, symlink depth rule, symlink-parent rejection, unsupported kinds, per-object hash verification, writes only inside the restore root).
+- `src/restore/compare.ts` — S3-R2 tree comparator (missing/misplaced-by-hash/unexpected/kind/mode/bytes/link-target).
+- `src/restore/context-seed.ts` — S3-R4 provider-to-session mapping, SQL rendering (quote escaping, `event_sequence` counter).
+- `src/restore/request-compare.ts` — S3-R4 comparator with the checked-in volatile policy (system.paths, system.platform, system.date, tools.shell.platform); `selectedPrompt` un-JSON-quotes the stored prompt.
+- `src/restore/worker.ts` — in-container orchestrator (preflight → materialize → tree compare → git init → proxy start → config rebind → bootstrap store init → seed → `run --session` → interception → comparison → reports).
+- `src/restore/cli.ts` — host driver (`npm run restore -- --store --checkpoint --output [--reuse-image --opencode-bin --timeout-ms]`), docker build/run with the store read-only.
+- `src/capture/proxy.ts` — added restore mode (`interceptRequests` + `onRequestIntercepted`): every model request answered locally, first primary captured before any forwarding; zero outbound inference by construction.
+- `containers/restore/Dockerfile`, `containers/restore/lock.json` — S3-R3 pinned runtime (base image digest, opencode 2.0.18 tarball SHA-256, baked version fingerprints).
+- `docs/restore.md` — commands, inclusion policy, runtime lock, volatile-field policy, failure semantics.
+- `tests/restore/` (25 unit tests), `tests/restore-e2e/restore.e2e.test.ts` (9 container tests).
+
+### Verification results
+
+- `npm run typecheck` — exit 0 (strict flags).
+- `npm run test` — 63 passed (includes 25 restore unit tests; capture suite untouched and green).
+- `npm run test:e2e` — 5 passed (real OpenCode capture suite, unaffected).
+- `npx vitest run tests/restore-e2e` — 9 passed (real Linux container, real OpenCode v2.0.18, pinned image `rl-restore:2.0.18`):
+  - S3-R3 probe: versions verified inside the container (opencode v2.0.18, Node 22, sqlite3, git) + deterministic read/write/read/delete probe in the private workspace.
+  - S3-R1/R2/R4/R7: two-turn capture → restore in a fresh container; tree exact; regenerated primary request matches the captured one after exactly four declared volatile transforms; selected prompt occurs once; later suffix absent; reports complete; exit 0.
+  - S3-R5: the same checkpoint restored twice into fresh containers; the store's file set and hashes unchanged after both; container leak check clean.
+  - S3-R6: missing object, corrupted object, invalid context, runtime launch failure, model-input mismatch, interception timeout — each exits nonzero with a named failed check and no provider forwarding; no leaked containers.
+- Evidence: `work/e2e/restore-fixture-*/` (capture source) and per-run evidence dirs under the test scratch (`result.json`, `comparison.json`, `regenerated-request.json`, `runtime.json`, `seed.sql`, `trace.jsonl`).
+
+### Limitations
+
+- Restore targets linux/arm64 (the host is Apple Silicon); an x64 lock is a backlog item.
+- The live-model smoke test belongs to Step 5; this step intercepts before forwarding by design.
+- OpenCode-internal fields (message ids, timestamps, token counters, agent labels) are inert in the seed and never compared; the comparison target is the provider request only.

@@ -93,6 +93,14 @@ export interface CaptureProxyOptions {
   /** Test hook: delay each artifact capture to prove dependent actions wait. */
   readonly artifactDelayMs?: number;
   /**
+   * Restore mode (Step 3): every model request is answered locally with a
+   * canned completion and NEVER forwarded upstream. The first primary task
+   * request is the regenerated input under comparison.
+   */
+  readonly interceptRequests?: true;
+  /** Called with each intercepted primary request body (restore mode). */
+  readonly onRequestIntercepted?: (body: string, recorded: RecordedRequest) => void;
+  /**
    * Runtime/configuration references persisted with every checkpoint.
    * Example: { opencodeVersion, configPath, isolatedHome, providerBaseURL }.
    */
@@ -189,6 +197,7 @@ export class CaptureProxy {
   async #handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const trace = this.#options.trace;
     try {
+      trace.append("http.received", { method: req.method, url: req.url });
       const body = await readBody(req);
       if (req.url === "/capture-gate" && req.method === "POST") {
         const identity = JSON.parse(body) as { sessionID?: unknown; messageID?: unknown };
@@ -1134,6 +1143,43 @@ export class CaptureProxy {
     onResponse?: (responseText: string, status: number) => void,
   ): Promise<void> {
     const trace = this.#options.trace;
+    // Restore mode: answer locally, never open an upstream connection.
+    if (this.#options.interceptRequests === true) {
+      const model = recorded.model ?? "unknown";
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      const created = Math.floor(Date.now() / 1000);
+      const id = "restore-intercepted";
+      for (const delta of [
+        { role: "assistant", content: "Restore interception: no model executed." },
+        {},
+      ] as const) {
+        const finish = delta.role === undefined ? "stop" : null;
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        })}\n\n`);
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+      trace.append("request.intercepted", {
+        index: recorded.index,
+        classification: recorded.classification,
+        model,
+      });
+      if (
+        this.#options.onRequestIntercepted !== undefined &&
+        (recorded.classification === "task-new-turn" || recorded.classification === "task-continuation")
+      ) {
+        this.#options.onRequestIntercepted(body, recorded);
+      }
+      return;
+    }
     const up = new URL(this.#options.upstreamURL);
     const basePath = up.pathname.replace(/\/[^/]*$/, "");
     // Manual concatenation: URL resolution with an absolute path would drop
