@@ -17,6 +17,11 @@ The export root also receives `result.json`: `{status, taskId, checkpoint, start
 
 Fixed output on success: `PACKAGE PASS: task=<task-id> package=<dir>`.
 
+Verifier flags:
+
+- `--verifier <script>`: install a task-success checker as `tests/test.sh`. Supplying a checker never marks the package validated by itself.
+- `--verifier-evidence <record.json>`: recorded validation evidence for the supplied checker (`{validatedAt, source}`). Only this combination is labeled `validated-task-reward`. Evidence without a checker is rejected. The exporter generates no rewards and validates no checkers itself..
+
 ## Layout
 
 ```text
@@ -50,10 +55,10 @@ The selected attempt's own response and tool actions are kept separate:
 - `schemaVersion`: 1.
 - `taskId`: `task-<checkpoint-id>`.
 - `createdAt`: ISO-8601 export time.
-- `verifier.status`: `unvalidated-candidate` or `validated-task-reward` (S4-R4). The default export is unvalidated: a generic success reward is never invented for arbitrary captures. A `--verifier` script is recorded as a validated task-specific reward for that task only.
+- `verifier.status`: `unvalidated-candidate` or `validated-task-reward` (S4-R4). The default export is unvalidated: a generic success reward is never invented for arbitrary captures. Supplying `--verifier` installs a task-success checker (`tests.kind: task-checker`) but keeps the status unvalidated. Only recorded validation evidence (`--verifier-evidence`, copied to `capture/verifier-evidence.json`) supports the `validated-task-reward` label; the evidence record must carry a parseable `validatedAt` and a non-empty `source`.
 - `selection`: `{checkpointId, sessionId, messageId, requestIndex, model, opencodeVersion}` from the stored records.
 - `instruction.path`: `instruction.md`; `origin`: `selected-user-request`.
-- `tests`: `{path: "tests/test.sh", kind}` where kind is `runtime-health-check` or `task-verifier`, consistent with `verifier.status`.
+- `tests`: `{path: "tests/test.sh", kind}` where kind is `runtime-health-check` (the no-checker default) or `task-checker` (a supplied task-success checker). A runtime health check cannot carry a validated status; a validated status requires `task-checker` plus evidence.
 - `environment.dockerfile`: `environment/Dockerfile`.
 - `runtimeLock`: `capture/runtime-lock.json`.
 - `inventory.objects`: every required object as `{sha256, bytes, references}`. The declared set must equal the referenced set exactly (manifest file hashes plus `referenced_artifacts.json` hashes); orphans and omissions both fail.
@@ -63,18 +68,21 @@ The selected attempt's own response and tool actions are kept separate:
 
 ## Validation (S4-R2)
 
-`validatePackage(<package-dir>)` validates from package contents alone. Named checks: `layout.files`, `metadata.schema`, `task.toml`, `task.toml.identity`, `paths.safe`, `objects.inventory` (existence, content hash, byte count, exact referenced-set equality), `records.present` (declared set equals actual set), `records.split`, `identity.consistent`, `credentials.absent`, `hostpaths.undeclared`, `environment.pinned`, `tests.kind`.
+`validatePackage(<package-dir>)` validates from package contents alone. Named checks: `layout.files`, `metadata.schema`, `task.toml`, `task.toml.identity`, `paths.safe`, `objects.inventory` (existence, content hash, byte count, exact referenced-set equality), `records.present` (declared set equals actual set), `records.split`, `identity.consistent`, `credentials.absent`, `hostpaths.undeclared`, `lock.schema`, `environment.pinned`, `verifier.evidence`, `tests.kind`.
 
+- Malformed metadata: validation stops immediately after `metadata.schema` fails; downstream checks never run and no exception escapes. Missing fields, wrong types, and null values all return the named failure.
 - Path escapes: object names must be bare SHA-256 hex; declared paths must be package-relative with no `..` traversal.
 - Corrupt objects: content hash mismatches fail.
 - Dangling references: any manifest/artifact hash missing from the inventory or from `capture/objects/` fails; so does any undeclared file in the checkpoint record set.
-- Credentials: package-authored files, checkpoint records, and evidence text are scanned for private key blocks, `sk-`-style tokens, and `Bearer` tokens. A hit fails the export before publication. Workspace object bytes are not scanned: workspace content is restored as captured under the Step 3 inclusion policy, and the capture store is the credential boundary (auth headers are never recorded there).
-- Source-host references: package-authored files (`capture/metadata.json`, `capture/runtime-lock.json`, `task.toml`, `environment/Dockerfile`, `tests/test.sh`) must not contain absolute unix home paths (`/Users/...`, `/home/...`, `/root/...`). `instruction.md` is exempt because its bytes are the captured prompt, preserved verbatim (S4-R1). The capture records keep their original absolute paths by design; Step 3's restore maps them under its declared path rules.
+- Credentials: package-authored files, the preserved instruction, checkpoint records, evidence text, and EVERY exported workspace object are scanned for private key blocks, `sk-`-style tokens, and `Bearer` tokens. Objects are scanned with a byte-preserving latin1 decode, so ASCII credential patterns are matched inside binary content too. A hit fails the export before publication. The capture store remains the credential boundary for capture itself (auth headers are never recorded there).
+- Source-host references: package-authored files (`capture/metadata.json`, `capture/runtime-lock.json`, `task.toml`, `environment/Dockerfile`, `tests/test.sh`) must not contain absolute unix home paths (`/Users/...`, `/home/...`, `/root/...`). `instruction.md` is exempt from the host-path scan because its bytes are the captured prompt, preserved verbatim (S4-R1) — but it is still credential-scanned. The capture records keep their original absolute paths by design; Step 3's restore maps them under its declared path rules.
+- Runtime lock (S4-R3): `lock.schema` requires every field of the documented lock: image name, `sha256:<64 hex>` image digest, tag, `linux/<arch>` platform, OpenCode version + https tarball URL containing the version + 64-hex checksum + absolute bin path, a frozen `https://snapshot.debian.org/archive/debian/<timestamp>` apt source, exact version pins for git, git-man, sqlite3, libsqlite3-0, ca-certificates, openssl, and libssl3, and a CA bootstrap package + sha256. `environment.pinned` then parses the Dockerfile and requires exact equality on every pinned value: the `ARG BASE_IMAGE` image and digest, the OpenCode version/sha256/URL args, `ENV OPENCODE_BIN`, the hashed CA bootstrap value, the locked snapshot in the apt `URIs:` line, and the exact apt package/version set (missing, extra, or drifted packages fail). Substring presence alone is never accepted.
+- Verifier evidence: a `validated-task-reward` label requires a declared evidence record that exists, parses, and carries a parseable `validatedAt` and a non-empty `source`. Declaring evidence without the validated status is also a failure.
 
 ## Runtime and portability (S4-R3)
 
-- `capture/runtime-lock.json` is a verbatim copy of `containers/restore/lock.json`: digest-pinned base image, checksum-pinned OpenCode build, exact apt versions from one frozen Debian snapshot.
-- `environment/Dockerfile` is generated from that lock (no value drift). Its registries are declared: Docker Hub (digest), `https://snapshot.debian.org/archive/debian/20261008T000000Z` (frozen, HTTPS), and the pinned OpenCode URL. It fetches and hash-checks the pinned CA bundle. Offline execution is not claimed and was not tested.
+- `capture/runtime-lock.json` is a verbatim copy of `containers/restore/lock.json`: digest-pinned base image, checksum-pinned OpenCode build, exact apt versions from one frozen Debian snapshot. The validator enforces the complete lock schema and exact Dockerfile agreement (see Validation above).
+- `environment/Dockerfile` is generated from that lock (no value drift). Its registries are declared: Docker Hub (digest), `https://snapshot.debian.org/archive/debian/20261008T000000Z` (frozen, HTTPS), and the pinned OpenCode URL. It fetches and hash-checks the pinned CA bundle (the lock's annotated source string is reduced to its URL base). Offline execution is not claimed and was not tested.
 - Portability proof: the package is relocated to an independent directory tree and `npm run restore -- --store <package>/capture --checkpoint <id> --output <run-dir>` (Step 3's command, unchanged) restores it in a fresh container with no access to the original store. Rebuilding `environment/Dockerfile` from the package was not exercised in Step 4; the restore uses the harness's identical pinned image.
 - The verifier script and `evidence/` live outside `capture/`, so they are not mounted into the restored workspace; the retrying agent's context is the materialized workspace plus the seeded conversation only.
 

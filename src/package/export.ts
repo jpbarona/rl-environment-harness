@@ -15,10 +15,12 @@
  * - Publication is atomic: the final task directory never exists until the
  *   fully staged package has passed validation. A failed export retains the
  *   staging directory as diagnostic evidence and publishes nothing (S4-R5).
- * - Verifier status is recorded explicitly: the default export is an
- *   unvalidated candidate whose tests/test.sh is a runtime health check;
- *   an explicitly supplied --verifier script is recorded as a validated
- *   task-specific reward for that task only (S4-R4).
+ * - Verifier status is recorded explicitly (S4-R4). The default export is
+ *   an unvalidated candidate whose tests/test.sh is a runtime health check.
+ *   An explicitly supplied --verifier script is installed as a task-success
+ *   checker but the package STAYS unvalidated unless recorded validation
+ *   evidence (--verifier-evidence) is supplied with it. The exporter never
+ *   generates rewards and never validates checkers itself.
  */
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -34,8 +36,18 @@ export interface ExportOptions {
   readonly checkpointId: string;
   /** Export root; the package is published at <outputDir>/<task-id>. */
   readonly outputDir: string;
-  /** Optional user-supplied validated task verifier script (S4-R4). */
+  /**
+   * Optional task-success checker script. Supplying one does NOT mark the
+   * package validated: the status stays `unvalidated-candidate` unless
+   * recorded validation evidence is also supplied (S4-R4).
+   */
   readonly verifierScript?: string;
+  /**
+   * Recorded validation evidence for the supplied checker (JSON with
+   * validatedAt + source). Required for a `validated-task-reward` label.
+   * No reward-generation or validation pipeline exists in the exporter.
+   */
+  readonly verifierEvidence?: string;
   /** Harness repository root (for containers/restore/lock.json); overridable in tests. */
   readonly repoRoot?: string;
   /** Test injection: throw after this many staged writes (S4-R5 evidence). */
@@ -166,6 +178,35 @@ export function exportPackage(options: ExportOptions): ExportOutcome {
       copyFileSync(from, to);
     };
 
+    // Verifier status (S4-R4): supplying a checker never auto-validates.
+    // The label is validated-task-reward only with recorded evidence.
+    let verifierStatus = "unvalidated-candidate";
+    let verifierEvidenceRecord: string | undefined;
+    if (options.verifierScript !== undefined && options.verifierEvidence === undefined) {
+      // Task-success checker installed; the package stays unvalidated.
+      record("verifier.status", true, "task checker installed; status unvalidated-candidate (no recorded validation evidence)");
+    }
+    if (options.verifierEvidence !== undefined) {
+      if (options.verifierScript === undefined) {
+        return fail("package.verifier-evidence-without-verifier", "--verifier-evidence requires --verifier: recorded evidence documents a specific checker");
+      }
+      let record: unknown;
+      try {
+        record = JSON.parse(readFileSync(options.verifierEvidence, "utf8"));
+      } catch (err) {
+        return fail("package.verifier-evidence-invalid", String(err instanceof Error ? err.message : err));
+      }
+      if (record === null || typeof record !== "object" || Array.isArray(record)) {
+        return fail("package.verifier-evidence-invalid", "verifier evidence must be a JSON object");
+      }
+      const r = record as { validatedAt?: unknown; source?: unknown };
+      if (typeof r.validatedAt !== "string" || Number.isNaN(Date.parse(r.validatedAt)) || typeof r.source !== "string" || r.source.trim() === "") {
+        return fail("package.verifier-evidence-invalid", "verifier evidence requires validatedAt (parseable timestamp) and source (non-empty)");
+      }
+      verifierStatus = "validated-task-reward";
+      verifierEvidenceRecord = options.verifierEvidence;
+    }
+
     // instruction.md: the selected request's exact bytes (S4-R1).
     write(join(stagingDir, "instruction.md"), instruction);
     // task.toml + environment + lock.
@@ -173,7 +214,7 @@ export function exportPackage(options: ExportOptions): ExportOutcome {
       { section: "task", key: "id", value: taskId },
       { section: "task", key: "version", value: 1 },
       { section: "task.instruction", key: "path", value: "instruction.md" },
-      { section: "verifier", key: "status", value: options.verifierScript !== undefined ? "validated-task-reward" : "unvalidated-candidate" },
+      { section: "verifier", key: "status", value: verifierStatus },
       { section: "environment", key: "dockerfile", value: "environment/Dockerfile" },
       { section: "capture", key: "schema_version", value: 1 },
       { section: "capture", key: "metadata", value: "capture/metadata.json" },
@@ -219,7 +260,7 @@ export function exportPackage(options: ExportOptions): ExportOutcome {
     }
 
     // tests/test.sh: runtime health check by default; an explicitly supplied
-    // verifier script replaces it and is recorded as a task reward (S4-R4).
+    // task-success checker replaces it (S4-R4). Status is set above.
     const testPath = join(stagingDir, "tests", "test.sh");
     if (options.verifierScript !== undefined) {
       copy(options.verifierScript, testPath);
@@ -227,6 +268,9 @@ export function exportPackage(options: ExportOptions): ExportOutcome {
       write(testPath, renderHealthCheckScript(lock));
     }
     chmodSync(testPath, 0o755);
+    if (verifierEvidenceRecord !== undefined) {
+      copy(verifierEvidenceRecord, join(stagingDir, "capture", "verifier-evidence.json"));
+    }
 
     // metadata.json last: it declares the final inventory and record sets.
     const recordFiles = listRecordFiles(recordsDir).map((p) => toPosix(relative(stagingDir, p)));
@@ -240,8 +284,9 @@ export function exportPackage(options: ExportOptions): ExportOutcome {
         checkpointId: options.checkpointId,
         selection,
         createdAt: startedAt,
-        verifierStatus: options.verifierScript !== undefined ? "validated-task-reward" : "unvalidated-candidate",
-        testKind: options.verifierScript !== undefined ? "task-verifier" : "runtime-health-check",
+        verifierStatus,
+        ...(verifierEvidenceRecord !== undefined ? { verifierEvidence: "capture/verifier-evidence.json" } : {}),
+        testKind: options.verifierScript !== undefined ? "task-checker" : "runtime-health-check",
         objects: [...inventory.values()],
         records: recordFiles,
         evidenceRecords,
@@ -324,6 +369,7 @@ function renderMetadata(input: {
   selection: { sessionId: string; messageId: string; requestIndex: number; model: string; opencodeVersion: string };
   createdAt: string;
   verifierStatus: string;
+  verifierEvidence?: string;
   testKind: string;
   objects: readonly InventoryEntry[];
   records: readonly string[];
@@ -333,7 +379,10 @@ function renderMetadata(input: {
     schemaVersion: 1,
     taskId: input.taskId,
     createdAt: input.createdAt,
-    verifier: { status: input.verifierStatus },
+    verifier: {
+      status: input.verifierStatus,
+      ...(input.verifierEvidence !== undefined ? { evidence: input.verifierEvidence } : {}),
+    },
     selection: {
       checkpointId: input.checkpointId,
       sessionId: input.selection.sessionId,
@@ -360,7 +409,10 @@ function renderMetadata(input: {
 
 /** Generate the package Dockerfile from the runtime lock (no value drift). */
 function renderPackageDockerfile(taskId: string, lock: RuntimeLock): string {
-  const snapshot = typeof lock.aptPackages["source"] === "string" ? lock.aptPackages["source"] : "";
+  // The lock's source may carry a parenthetical annotation; the Dockerfile
+  // uses the annotation-free base URL for every fetch and apt source.
+  const sourceRaw = typeof lock.aptPackages["source"] === "string" ? lock.aptPackages["source"] : "";
+  const snapshot = sourceRaw.trim().split(/\s+/)[0] ?? "";
   const packages = Object.entries(lock.aptPackages)
     .filter(([key, value]) => key !== "source" && key !== "caCertBootstrap" && typeof value === "string")
     .map(([key, value]) => `      ${key}=${String(value)}`)

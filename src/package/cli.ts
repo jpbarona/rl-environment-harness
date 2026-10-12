@@ -22,6 +22,7 @@ interface Args {
   readonly checkpoint: string;
   readonly output: string;
   readonly verifier?: string | undefined;
+  readonly verifierEvidence?: string | undefined;
 }
 
 function parseArgs(argv: readonly string[]): Args {
@@ -33,7 +34,7 @@ function parseArgs(argv: readonly string[]): Args {
   const checkpoint = get("--checkpoint");
   const output = get("--output");
   if (store === undefined || checkpoint === undefined || output === undefined) {
-    console.error("usage: npm run package -- --store <path> --checkpoint <id> --output <export-root> [--verifier <script>]");
+    console.error("usage: npm run package -- --store <path> --checkpoint <id> --output <export-root> [--verifier <script> [--verifier-evidence <record.json>]]");
     process.exit(2);
   }
   return {
@@ -41,6 +42,7 @@ function parseArgs(argv: readonly string[]): Args {
     checkpoint,
     output: resolve(output),
     verifier: get("--verifier"),
+    verifierEvidence: get("--verifier-evidence"),
   };
 }
 
@@ -77,6 +79,12 @@ function main(): void {
     console.error(`Report: ${join(args.output, "result.json")}`);
     process.exit(1);
   }
+  if (args.verifierEvidence !== undefined && !existsSync(args.verifierEvidence)) {
+    writeResult("FAIL", [{ check: "package.verifier-evidence-missing", ok: false, detail: `FAILED — verifier evidence record does not exist: ${args.verifierEvidence}` }], {});
+    console.error(`PACKAGE FAIL: failed check=package.verifier-evidence-missing — ${args.verifierEvidence}`);
+    console.error(`Report: ${join(args.output, "result.json")}`);
+    process.exit(1);
+  }
   if (!existsSync(args.store)) {
     writeResult("FAIL", [{ check: "selection.store-missing", ok: false, detail: `FAILED — capture store does not exist: ${args.store}` }], {});
     console.error(`PACKAGE FAIL: failed check=selection.store-missing — ${args.store}`);
@@ -89,6 +97,7 @@ function main(): void {
     checkpointId: args.checkpoint,
     outputDir: args.output,
     ...(args.verifier !== undefined ? { verifierScript: resolve(args.verifier) } : {}),
+    ...(args.verifierEvidence !== undefined ? { verifierEvidence: resolve(args.verifierEvidence) } : {}),
     repoRoot,
   });
 

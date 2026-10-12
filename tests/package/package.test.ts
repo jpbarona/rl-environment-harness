@@ -8,13 +8,13 @@
 import { describe, expect, it, beforeAll } from "vitest";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { snapshotWorkspace } from "../../src/capture/snapshot.js";
 import { exportPackage } from "../../src/package/export.js";
-import { validatePackage } from "../../src/package/validate.js";
+import { validatePackage, type PackageValidation } from "../../src/package/validate.js";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
 
@@ -225,15 +225,16 @@ describe("S4-R1/R2 export and validation", () => {
 });
 
 describe("S4-R4 verifier labeling", () => {
-  it("records a supplied verifier as a validated task reward and runs correct/incorrect outputs", () => {
+  it("keeps a supplied checker unvalidated without recorded evidence; runs correct/incorrect outputs", () => {
     const verifier = join(repoRoot, "tests", "package", "fixtures", "fixture-verifier.sh");
     const out = join(root, "export-verified");
     const outcome = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: out, repoRoot, verifierScript: verifier });
     expect(outcome.status).toBe("PASS");
     const pkg = outcome.packageDir!;
     const metadata = JSON.parse(readFileSync(join(pkg, "capture", "metadata.json"), "utf8")) as { verifier: { status: string }; tests: { kind: string } };
-    expect(metadata.verifier.status).toBe("validated-task-reward");
-    expect(metadata.tests.kind).toBe("task-verifier");
+    // Supplying a checker must NOT auto-label it validated (S4-R4 fix 4).
+    expect(metadata.verifier.status).toBe("unvalidated-candidate");
+    expect(metadata.tests.kind).toBe("task-checker");
     expect(validatePackage(pkg).ok).toBe(true);
 
     // Correct output passes; incorrect output fails. Both on scratch trees.
@@ -251,6 +252,44 @@ describe("S4-R4 verifier labeling", () => {
       failed = true;
     }
     expect(failed).toBe(true);
+  });
+
+  it("labels validated-task-reward only with recorded validation evidence", () => {
+    const verifier = join(repoRoot, "tests", "package", "fixtures", "fixture-verifier.sh");
+    const evidence = join(root, "verifier-evidence.json");
+    writeFileSync(evidence, JSON.stringify({
+      validatedAt: new Date().toISOString(),
+      source: "unit fixture validation: correct and incorrect outputs produce expected results",
+    }));
+    const out = join(root, "export-verified-evidence");
+    const outcome = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: out, repoRoot, verifierScript: verifier, verifierEvidence: evidence });
+    expect(outcome.status).toBe("PASS");
+    const pkg = outcome.packageDir!;
+    const metadata = JSON.parse(readFileSync(join(pkg, "capture", "metadata.json"), "utf8")) as { verifier: { status: string; evidence?: string } };
+    expect(metadata.verifier.status).toBe("validated-task-reward");
+    expect(metadata.verifier.evidence).toBe("capture/verifier-evidence.json");
+    expect(existsSync(join(pkg, "capture", "verifier-evidence.json"))).toBe(true);
+    const validation = validatePackage(pkg);
+    expect(validation.ok).toBe(true);
+    expect(validation.checks.some((c) => c.check === "verifier.evidence" && c.ok)).toBe(true);
+  });
+
+  it("fails on missing or malformed verifier evidence", () => {
+    const verifier = join(repoRoot, "tests", "package", "fixtures", "fixture-verifier.sh");
+    // Evidence declared but the file is absent.
+    const missing = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: join(root, "neg-evidence-missing"), repoRoot, verifierScript: verifier, verifierEvidence: join(root, "no-such-evidence.json") });
+    expect(missing.status).toBe("FAIL");
+    expect(missing.checks.some((c) => c.check === "package.verifier-evidence-invalid" && !c.ok)).toBe(true);
+    // Evidence file exists but is malformed.
+    const bad = join(root, "bad-evidence.json");
+    writeFileSync(bad, JSON.stringify({ validatedAt: "not-a-timestamp" }));
+    const invalid = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: join(root, "neg-evidence-invalid"), repoRoot, verifierScript: verifier, verifierEvidence: bad });
+    expect(invalid.status).toBe("FAIL");
+    expect(invalid.checks.some((c) => c.check === "package.verifier-evidence-invalid" && !c.ok)).toBe(true);
+    // Evidence without a checker is rejected.
+    const orphan = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: join(root, "neg-evidence-orphan"), repoRoot, verifierEvidence: bad });
+    expect(orphan.status).toBe("FAIL");
+    expect(orphan.checks.some((c) => c.check === "package.verifier-evidence-without-verifier" && !c.ok)).toBe(true);
   });
 });
 
@@ -393,5 +432,176 @@ describe("S4-R5 injected export-write failure", () => {
     const storeBefore = checksumStore(store);
     exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: join(root, "neg-write-failure-2"), repoRoot, failAfterWrite: 0 });
     expect(checksumStore(store)).toBe(storeBefore);
+  });
+});
+
+describe("S4-R2 credential exclusion in instruction and objects", () => {
+  it("rejects a synthetic secret inside an exported workspace object before publication", () => {
+    // Synthetic value only; never a real key.
+    const secret = "sk-synthetic-fixture-secret-0123456789abcdef";
+    const secretStore = copyStore((copy) => {
+      // Rewrite the notes.md object with secret content and keep the store
+      // self-consistent (new object name, manifest updated) so only the
+      // credential scan can fail the export.
+      const manifestPath = join(copy, "checkpoints", ckpt, "manifest.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { files: Array<{ path: string; sha256?: string }> };
+      const victim = manifest.files.find((f) => f.path === "notes.md")!;
+      const content = `# notes\n${secret}\n`;
+      const newSha = createHash("sha256").update(content).digest("hex");
+      writeFileSync(join(copy, "objects", newSha), content);
+      rmSync(join(copy, "objects", victim.sha256!));
+      victim.sha256 = newSha;
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    });
+    const out = join(root, "neg-object-secret");
+    const outcome = exportPackage({ storeRoot: secretStore, checkpointId: ckpt, outputDir: out, repoRoot });
+    expect(outcome.status).toBe("FAIL");
+    expect(outcome.checks.some((c) => c.check === "package.validated" && !c.ok && c.detail.includes("credentials.absent"))).toBe(true);
+    expect(existsSync(join(out, `task-${ckpt}`))).toBe(false);
+    const validation = validatePackage(outcome.stagingDir);
+    expect(validation.checks.some((c) => c.check === "credentials.absent" && !c.ok && c.detail.includes("capture/objects/"))).toBe(true);
+    rmSync(outcome.stagingDir, { recursive: true, force: true });
+  });
+
+  it("rejects a synthetic secret inside the preserved instruction", () => {
+    // The instruction bytes come from the selected prompt; plant the secret
+    // there through a store copy.
+    const secret = "sk-synthetic-fixture-secret-fedcba9876543210";
+    const secretStore = copyStore((copy) => {
+      const requestsPath = join(copy, "checkpoints", ckpt, "model_requests.jsonl");
+      const lines = readFileSync(requestsPath, "utf8").trim().split("\n").map((line) => {
+        const rec = JSON.parse(line) as { classification: string; body?: { messages?: Array<{ role: string; content?: string }> } };
+        if (rec.classification.startsWith("task") && rec.body?.messages !== undefined) {
+          const user = rec.body.messages.find((m) => m.role === "user");
+          if (user !== undefined) {
+            user.content = JSON.stringify(`${PROMPT} with key ${secret}`);
+          }
+        }
+        return JSON.stringify(rec);
+      });
+      writeFileSync(requestsPath, `${lines.join("\n")}\n`);
+    });
+    const out = join(root, "neg-instruction-secret");
+    const outcome = exportPackage({ storeRoot: secretStore, checkpointId: ckpt, outputDir: out, repoRoot });
+    expect(outcome.status).toBe("FAIL");
+    expect(existsSync(join(out, `task-${ckpt}`))).toBe(false);
+    const validation = validatePackage(outcome.stagingDir);
+    expect(validation.checks.some((c) => c.check === "credentials.absent" && !c.ok && c.detail.includes("instruction.md"))).toBe(true);
+    rmSync(outcome.stagingDir, { recursive: true, force: true });
+  });
+});
+
+describe("S4-R2 runtime lock schema and Dockerfile agreement", () => {
+  it("fails when the exported lock is missing required pins", () => {
+    const out = join(root, "export-lock-schema");
+    const outcome = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: out, repoRoot });
+    const pkg = outcome.packageDir!;
+    const lockPath = join(pkg, "capture", "runtime-lock.json");
+    const lock = JSON.parse(readFileSync(lockPath, "utf8")) as Record<string, unknown>;
+    // Drop the sqlite3 pin.
+    delete (lock["aptPackages"] as Record<string, unknown>)["sqlite3"];
+    writeFileSync(lockPath, JSON.stringify(lock));
+    const validation = validatePackage(pkg);
+    expect(validation.ok).toBe(false);
+    expect(validation.checks.some((c) => c.check === "lock.schema" && !c.ok && c.detail.includes("sqlite3"))).toBe(true);
+
+    // Unparseable digest.
+    const broken = JSON.parse(readFileSync(lockPath, "utf8")) as Record<string, unknown>;
+    broken["imageDigest"] = "not-a-digest";
+    writeFileSync(lockPath, JSON.stringify(broken));
+    const second = validatePackage(pkg);
+    expect(second.checks.some((c) => c.check === "lock.schema" && !c.ok)).toBe(true);
+  });
+
+  it("fails when the Dockerfile disagrees with the lock on a pinned value", () => {
+    const out = join(root, "export-lock-agreement");
+    const outcome = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: out, repoRoot });
+    const pkg = outcome.packageDir!;
+    const dockerfilePath = join(pkg, "environment", "Dockerfile");
+    // Drift one apt version.
+    let df = readFileSync(dockerfilePath, "utf8");
+    df = df.replace("sqlite3=3.40.1-2+deb12u2", "sqlite3=3.40.1-2+deb12u3");
+    writeFileSync(dockerfilePath, df);
+    let validation = validatePackage(pkg);
+    expect(validation.ok).toBe(false);
+    expect(validation.checks.some((c) => c.check === "environment.pinned" && !c.ok && c.detail.includes("sqlite3"))).toBe(true);
+
+    // Drift the OpenCode checksum ARG.
+    const lock = JSON.parse(readFileSync(join(pkg, "capture", "runtime-lock.json"), "utf8")) as { opencode: { sha256: string } };
+    df = readFileSync(dockerfilePath, "utf8");
+    df = df.replace(`ARG OPENCODE_SHA256=${lock.opencode.sha256}`, `ARG OPENCODE_SHA256=${"f".repeat(64)}`);
+    writeFileSync(dockerfilePath, df);
+    validation = validatePackage(pkg);
+    expect(validation.checks.some((c) => c.check === "environment.pinned" && !c.ok && c.detail.includes("sha256 ARG"))).toBe(true);
+
+    // Unlockable extra package in the install block.
+    df = readFileSync(dockerfilePath, "utf8");
+    df = df.replace("      git=", "      curl=1:7.88.1-10+deb12u8 \\\n      git=");
+    writeFileSync(dockerfilePath, df);
+    validation = validatePackage(pkg);
+    expect(validation.checks.some((c) => c.check === "environment.pinned" && !c.ok && c.detail.includes("curl"))).toBe(true);
+  });
+});
+
+describe("S4-R2 malformed metadata stops validation with a named failure", () => {
+  function tamperedMetadata(name: string, mutate: (metadata: Record<string, unknown>) => void): PackageValidation {
+    const pkg = join(root, name);
+    // Build a fresh valid package, then corrupt its metadata copy.
+    const outcome = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: join(root, `${name}-src`), repoRoot });
+    if (outcome.status !== "PASS") {
+      throw new Error("fixture export failed");
+    }
+    cpSync(outcome.packageDir!, pkg, { recursive: true });
+    const metadataPath = join(pkg, "capture", "metadata.json");
+    const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as Record<string, unknown>;
+    mutate(metadata);
+    writeFileSync(metadataPath, JSON.stringify(metadata));
+    return validatePackage(pkg);
+  }
+
+  it("missing selection stops immediately with metadata.schema, without throwing", () => {
+    const validation = tamperedMetadata("neg-null-selection", (m) => {
+      delete m["selection"];
+    });
+    expect(validation.ok).toBe(false);
+    expect(validation.checks).toHaveLength(1);
+    expect(validation.checks[0]?.check).toBe("metadata.schema");
+    expect(validation.checks[0]?.detail).toContain("selection identity incomplete");
+  });
+
+  it("null and wrong-typed fields produce named schema failures, not exceptions", () => {
+    const nullVerifier = tamperedMetadata("neg-null-verifier", (m) => {
+      m["verifier"] = null;
+    });
+    expect(nullVerifier.ok).toBe(false);
+    expect(nullVerifier.checks[0]?.check).toBe("metadata.schema");
+
+    const nullInventory = tamperedMetadata("neg-null-inventory", (m) => {
+      m["inventory"] = null;
+    });
+    expect(nullInventory.ok).toBe(false);
+    expect(nullInventory.checks[0]?.check).toBe("metadata.schema");
+
+    const wrongTypes = tamperedMetadata("neg-wrong-types", (m) => {
+      const selection = m["selection"] as Record<string, unknown>;
+      selection["sessionId"] = 123;
+      selection["requestIndex"] = "five";
+      m["schemaVersion"] = "1";
+      m["inventory"] = { objects: "all", records: [], evidenceRecords: [] };
+    });
+    expect(wrongTypes.ok).toBe(false);
+    expect(wrongTypes.checks[0]?.check).toBe("metadata.schema");
+    expect(wrongTypes.checks[0]?.detail).toContain("selection identity incomplete");
+  });
+
+  it("a JSON-null metadata document returns the named failure", () => {
+    const pkg = join(root, "neg-null-doc");
+    const outcome = exportPackage({ storeRoot: store, checkpointId: ckpt, outputDir: join(root, "neg-null-doc-src"), repoRoot });
+    cpSync(outcome.packageDir!, pkg, { recursive: true });
+    writeFileSync(join(pkg, "capture", "metadata.json"), "null\n");
+    const validation = validatePackage(pkg);
+    expect(validation.ok).toBe(false);
+    expect(validation.checks).toHaveLength(1);
+    expect(validation.checks[0]?.check).toBe("metadata.schema");
   });
 });
