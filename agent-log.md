@@ -757,3 +757,47 @@ R1 PASS (identity/instruction preserved, suffix split, e2e suffix-absence assert
 - `evidence/tool_outputs.jsonl` is copied only when the source checkpoint has one; the active record set never includes it (restore does not read it).
 
 **Next step:** Step 5 — connect `!checkpoint`, export, restore-check, and the bounded live attempt (docs/step-5-requirements.md). Not started.
+
+## Entry 022 — Step 4 review fixes: credential exclusion, lock schema, metadata failure, verifier evidence
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent.
+**Date:** 2026-10-11, America/New_York.
+**Branch:** `step-4`. **Revision:** commit `39c6f17` (code, tests, docs); this entry appended after verification. PR #3 targets `main` (retargeted from `attempt-1`; `main` is the repository default branch).
+
+### Fix 1 — Credential exclusion extended to instruction and objects (S4-R2)
+
+- The `credentials.absent` scan now covers package-authored files, the preserved `instruction.md`, checkpoint records, evidence text, and EVERY exported workspace object. Objects are scanned with a byte-preserving latin1 decode so ASCII credential patterns (private key blocks, `sk-` tokens, `Bearer` tokens) match inside binary content too. [Citation: `src/package/validate.ts` `scanCredentialPatterns` + `readObjectText`; `tests/package/package.test.ts` `rejects a synthetic secret inside an exported workspace object`, `rejects a synthetic secret inside the preserved instruction`.]
+- Rejection happens before publication: the scan runs in the staging validation, so a hit fails `package.validated`, nothing is renamed to the target, and the staging directory is retained. Both new tests assert the target path does not exist and the staging package fails with the named `credentials.absent` check. Synthetic values only (`sk-synthetic-fixture-secret-...`); no real keys anywhere. [Citation: the two test names above.]
+
+### Fix 2 — Runtime lock schema and exact Dockerfile agreement (S4-R3)
+
+- New `lock.schema` check requires the complete lock: image name, `sha256:<64 hex>` digest, tag, `linux/<arch>` platform, OpenCode version + https tarball URL containing the version + 64-hex checksum + absolute bin path, a frozen `https://snapshot.debian.org/archive/debian/<timestamp>` apt source, exact version pins for git, git-man, sqlite3, libsqlite3-0, ca-certificates, openssl, libssl3, and a CA bootstrap package + sha256. Missing pins fail by name. [Citation: `src/package/validate.ts` `lockSchemaErrors`; test `fails when the exported lock is missing required pins` (deleted sqlite3 pin and a non-digest imageDigest both fail).]
+- `environment.pinned` now parses the Dockerfile instead of substring-matching: `ARG BASE_IMAGE` image and digest, `ARG OPENCODE_VERSION/SHA256/URL`, `ENV OPENCODE_BIN`, the hashed CA value parsed from the `echo "<64hex>"` verification line, the locked frozen snapshot in the apt `URIs:` reference, and the exact apt package/version set parsed from the install block. Missing, extra, or drifted packages fail; a drifted sha256 ARG fails. [Citation: `validateLockAgreement`; test `fails when the Dockerfile disagrees with the lock on a pinned value` (sqlite3 version drift, OpenCode sha drift, and an unlocked curl package each fail).]
+- Exporter fix found by the new check: the lock's annotated `aptPackages.source` string (`"...T000000Z (bookworm main, frozen, HTTPS only)"`) leaked verbatim into the generated Dockerfile's fetch URLs; the exporter now uses the annotation-free URL base, and the validator accepts the annotated form while pinning the base. [Citation: `renderPackageDockerfile` snapshotBase split; `lockSchemaErrors` source regex with optional annotation.]
+
+### Fix 3 — Malformed metadata stops validation with a named failure (S4-R2)
+
+- `validatePackage` records `metadata.schema` and returns immediately when any schema error exists; downstream checks never run. `metadataSchemaErrors` is null-safe: a null or non-object `verifier`/`selection`/`instruction`/`tests`/`environment`/`inventory`/`evidence`, wrong field types, and a JSON-null document all produce the named `metadata.schema` failure instead of a thrown TypeError. [Citation: early return after the schema record; tests `missing selection stops immediately with metadata.schema, without throwing` (single named check), `null and wrong-typed fields produce named schema failures, not exceptions`, `a JSON-null metadata document returns the named failure`.]
+
+### Fix 4 — Verifier status requires recorded evidence (S4-R4)
+
+- Supplying `--verifier` installs the script as a task-success checker (`tests.kind: task-checker`) and the package STAYS `unvalidated-candidate`. A `validated-task-reward` label requires `--verifier-evidence <record.json>` carrying a parseable `validatedAt` and a non-empty `source`; the record is copied into the package at `capture/verifier-evidence.json` and validated (`verifier.evidence` check). Evidence without a checker, malformed evidence, missing evidence, and evidence declared without the validated status all fail. No reward-generation or validation pipeline was built; the health-check versus task-checker distinction is preserved in `tests.kind`. [Citation: `src/package/export.ts` verifier block; `validateVerifierEvidence`; tests `keeps a supplied checker unvalidated without recorded evidence...`, `labels validated-task-reward only with recorded validation evidence`, `fails on missing or malformed verifier evidence`.]
+
+### Verification (commands and results)
+
+1. `npx tsc --noEmit` — exit 0.
+2. `npm run test` — 100 passed, 0 failed (adds 9 package regression tests: 2 synthetic-secret, 2 lock schema/agreement, 3 malformed-metadata, 3 verifier-evidence; the pre-existing record-credential negative still passes).
+3. `npm run verify` — typecheck + 100 unit + 5 real OpenCode capture e2e, all pass.
+4. `npm run test:package-e2e` — 4 passed, 291 s (real Linux container, real OpenCode v2.0.18): ordinary two-turn, truncation-artifact, and compaction fixtures export, relocate, and restore through Step 3's command with PASS results; export failure reporting unchanged. Evidence root: `/var/folders/21/yff35t8977n9_7z54_9jjqp40000gn/T/package-e2e-82WHg3/`.
+5. `npm run test:restore-e2e` — 12 passed, 843 s (Step 3 baseline unchanged).
+
+### Remaining gaps
+
+- Workspace objects are now credential-scanned as text (latin1); a credential split across a multibyte boundary or encoded (base64) content is not detected. The scan is a pattern guard, not a semantic analysis; documented in docs/package.md.
+- The generated `environment/Dockerfile` remains unbuilt in Step 4 tests (the restore uses the harness's identical pinned image); its agreement with the lock is validated textually, field by field.
+
+### S4-R1–R5 status (unchanged baselines, strengthened checks)
+
+R1 PASS · R2 PASS (credential scan widened, lock schema/agreement added, malformed metadata named-failure path) · R3 PASS · R4 PASS (evidence-gated validated label; health-check versus task-checker distinction preserved) · R5 PASS.
+
+**Next step:** Step 5 — connect `!checkpoint`, export, restore-check, and the bounded live attempt (docs/step-5-requirements.md). Not started.
