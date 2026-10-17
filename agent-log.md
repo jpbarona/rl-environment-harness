@@ -801,3 +801,13 @@ R1 PASS (identity/instruction preserved, suffix split, e2e suffix-absence assert
 R1 PASS · R2 PASS (credential scan widened, lock schema/agreement added, malformed metadata named-failure path) · R3 PASS · R4 PASS (evidence-gated validated label; health-check versus task-checker distinction preserved) · R5 PASS.
 
 **Next step:** Step 5 — connect `!checkpoint`, export, restore-check, and the bounded live attempt (docs/step-5-requirements.md). Not started.
+
+
+## Step 5 design update — user-approved background Harbor workflow
+
+**Author:** Codex. **Date:** 2026-10-17, America/New_York (client date). **Status:** documentation only; implementation and integration remain unverified.
+
+- **User requirements recorded:** quoted noninteractive checkpoint description; existing last-attempt selection; detached background jobs; configured workspace/output; tasks/jobs layout; two immutable image identities; separate verifier; script/model judging; one solver reward; independent universal quality review; aggregate $0.20 checkpoint model cap; atomic publication. [Citation: planning conversation, user messages beginning “it shouldnt be as interactive”, “you forgot about the judge”, “i agree reward”, “we can use a sperate agent”, “Cost. $0.20 limit per checkpoint”, and authorization “write it in the ... project md files” / “dont add ANYTHING we have not discussed”.]
+- **Documentation changes:** design.md and docs/step-5-requirements.md now record that scope and its acceptance evidence. Earlier explicit-selector and synchronous-smoke scope is superseded only for Step 5; the existing live-capture test's $0.10 contract is unchanged. Numerical quality-rubric weights remain unspecified; no threshold or human approval gate is introduced. [Citation: current design.md and docs/step-5-requirements.md; direct user instructions above.]
+- **Interface references verified:** upstream task overview, separate verifier/artifact transfer, RewardKit quick-start/judge criteria, and agent/trajectory references. They are documentation entry points, not release pins. Implementer must select and record compatible pinned versions. [Citation: https://docs.harborframework.com/tasks/overview ; https://docs.harborframework.com/tasks/separate-verifier ; https://docs.harborframework.com/rewardkit/quick-start ; https://docs.harborframework.com/rewardkit/judge-criteria ; https://docs.harborframework.com/agents/custom-agents ; https://docs.harborframework.com/agents/atif .]
+- **Next action:** implement Step 5 against the revised requirements; no code changes, model calls, runtime tests or compatibility claims are part of this documentation update. [Citation: scope of this entry and docs/step-5-requirements.md completion gate.]
