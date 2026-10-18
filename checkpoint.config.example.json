@@ -1,0 +1,44 @@
+{
+  "storePath": "/absolute/path/to/capture-store",
+  "outputDir": "/absolute/path/to/output",
+  "jobsDir": "/absolute/path/to/output/jobs",
+  "captureServiceURL": "http://127.0.0.1:<capture-proxy-port>",
+  "writer": {
+    "baseURL": "https://openrouter.ai/api/v1",
+    "model": "openrouter/writer-model-id",
+    "apiKeyEnv": "WRITER_API_KEY",
+    "maxOutputTokens": 8192
+  },
+  "reviewer": {
+    "baseURL": "https://openrouter.ai/api/v1",
+    "model": "openrouter/reviewer-model-id",
+    "apiKeyEnv": "REVIEWER_API_KEY",
+    "maxOutputTokens": 2048
+  },
+  "judgeModel": "openrouter/judge-model-id",
+  "solver": {
+    "baseURL": "https://openrouter.ai/api/v1",
+    "model": "ignored-the-captured-model-id-is-used",
+    "apiKeyEnv": "SOLVER_API_KEY",
+    "providerName": "openrouter",
+    "maxOutputTokens": 4096
+  },
+  "verifierEnv": {
+    "OPENAI_API_KEY": "JUDGE_API_KEY",
+    "OPENAI_BASE_URL": "JUDGE_BASE_URL"
+  },
+  "credentials": {
+    "note": "environment-variable NAMES only; values are resolved at runtime and never stored"
+  },
+  "modelSpendCapUSD": 0.20,
+  "timeouts": {
+    "writerMs": 180000,
+    "reviewerMs": 180000,
+    "judgeSec": 300,
+    "harborSec": 1200
+  },
+  "retries": {
+    "writer": 1,
+    "reviewer": 1
+  }
+}

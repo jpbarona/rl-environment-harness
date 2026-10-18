@@ -23,6 +23,8 @@ node_modules/
 *.pfx
 /secrets/
 opencode.local.json
+checkpoint.config.json
+/output/
 
 # Local operating-system and editor files
 .DS_Store
@@ -30,3 +32,4 @@ opencode.local.json
 *.swp
 *.swo
 *~
+python/__pycache__/

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Project-controlled checkpoint command for OpenCode's shell PATH (S5-R1).
+#
+#   checkpoint "<failure description>"    queue a background job
+#   checkpoint scores                     deterministic status listing
+#
+# Install: add this repository's bin/ directory to PATH. The command never
+# prompts and returns promptly; the pipeline runs detached in the background.
+set -eu
+HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec node "$HARNESS_ROOT/dist/checkpoint/cli.js" "$@"

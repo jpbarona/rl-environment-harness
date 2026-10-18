@@ -10,8 +10,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run --exclude 'tests/e2e/**' --exclude 'tests/live/**' --exclude 'tests/restore-e2e/**'",
-    "test:e2e": "vitest run tests/e2e --exclude 'tests/e2e/package.e2e.test.ts'",
+    "test:e2e": "vitest run tests/e2e --exclude 'tests/e2e/package.e2e.test.ts' --exclude 'tests/e2e/checkpoint.e2e.test.ts'",
     "test:package-e2e": "npm run -s build && vitest run tests/e2e/package.e2e.test.ts",
+    "test:checkpoint-e2e": "npm run -s build && vitest run tests/e2e/checkpoint.e2e.test.ts",
     "test:restore-e2e": "npm run -s build && vitest run tests/restore-e2e",
     "test:watch": "vitest",
     "build": "tsc -p tsconfig.build.json",
