@@ -963,3 +963,12 @@ R1 PASS · R2 PASS · R3 PASS (writer now sees file contents; breakdown retained
 ### Remaining live-provider validation gap (unchanged from Entry 025)
 
 - The opt-in live test is ready but blocked by the OpenRouter account, not by code: every free-model endpoint returns HTTP 404 "0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy" (8 provider families probed with full errors). One manual run of `tests/live/checkpoint.live.test.ts` after the account's data-policy setting allows free endpoints (or with an authorized paid model) closes the gap.
+
+## Entry 027 — workspace artifact cleanup at user request
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `step-5`.
+
+- Removed `work/e2e` (3.7 GB of accumulated e2e/live run artifacts) and `work/harbor-smoke` (116 MB of smoke fixtures). No code references either path. Consequently, evidence paths under `work/e2e/...` cited in Entries 023-026 and under `work/harbor-smoke/...` in earlier entries no longer exist on disk. The recorded RESULTS (statuses, scores, durations, test outcomes) stand as documented. Runs recreate their artifacts from scratch; nothing in the pipeline or tests reads these directories.
+- Kept: `work/harbor-venv` (332 MB, the pinned Harbor 0.24.0 + RewardKit 0.2.3 environment the runner requires) and `work/live-checkpoint` (972 KB, the only on-disk live-run evidence).
+- Docker: removed the eight agent-created job and smoke images (rl-task-task-001/002 solver + verifier, smoke2-test, smokeprobe2-main, smokeprobe-main, task2__bzpm48y__env-main, about 6 GB) and 1.5 GB of build cache. Left untouched: the user's sim-engine and postgres containers and images, the pinned bases (rl-restore:2.0.18, node:22-bookworm-slim).
+- Repository size after cleanup: 386 MB.
