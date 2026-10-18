@@ -65,6 +65,32 @@ export function exportFrozenCapture(options: {
   return exported.packageDir;
 }
 
+/**
+ * Recorded runtime rebinds applied to a materialized replay workspace.
+ * Shared by the writer context and the task builder so the workspace the
+ * writer sees is EXACTLY the workspace the solver starts from. Mutations
+ * are returned for the build report and the writer prompt.
+ */
+export function applyReplayTransformations(appDir: string): string[] {
+  const mutations: string[] = [];
+  const workspaceConfigPath = join(appDir, "opencode.json");
+  if (existsSync(workspaceConfigPath)) {
+    const workspaceConfig = JSON.parse(readFileSync(workspaceConfigPath, "utf8")) as Record<string, unknown>;
+    if ("provider" in workspaceConfig || "model" in workspaceConfig) {
+      delete workspaceConfig["provider"];
+      delete workspaceConfig["model"];
+      writeFileSync(workspaceConfigPath, `${JSON.stringify(workspaceConfig, null, 2)}\n`);
+      mutations.push("removed provider/model from workspace opencode.json (runtime selects the solver endpoint)");
+    }
+  }
+  const pluginPath = join(appDir, ".opencode", "plugins", "capture-plugin.ts");
+  if (existsSync(pluginPath)) {
+    rmSync(pluginPath);
+    mutations.push("removed the capture plugin from the baked workspace (no recorder proxy in the solver)");
+  }
+  return mutations;
+}
+
 /** Build the Harbor task draft under <jobDir>/task. */
 export function buildHarborTask(options: {
   readonly config: SystemConfig;
@@ -114,23 +140,8 @@ export function buildHarborTask(options: {
   const appDir = join(environmentDir, "app");
   materializeWorkspace(config.storePath, manifest, appDir);
   // Runtime rebinds required for a live solver run (recorded, not silent):
-  // the capture-time provider config points at the dead capture proxy, and
-  // the capture plugin has no service to gate on inside the solver.
-  const workspaceConfigPath = join(appDir, "opencode.json");
-  if (existsSync(workspaceConfigPath)) {
-    const workspaceConfig = JSON.parse(readFileSync(workspaceConfigPath, "utf8")) as Record<string, unknown>;
-    if ("provider" in workspaceConfig || "model" in workspaceConfig) {
-      delete workspaceConfig["provider"];
-      delete workspaceConfig["model"];
-      writeFileSync(workspaceConfigPath, `${JSON.stringify(workspaceConfig, null, 2)}\n`);
-      mutations.push("removed provider/model from workspace opencode.json (runtime selects the solver endpoint)");
-    }
-  }
-  const pluginPath = join(appDir, ".opencode", "plugins", "capture-plugin.ts");
-  if (existsSync(pluginPath)) {
-    rmSync(pluginPath);
-    mutations.push("removed the capture plugin from the baked workspace (no recorder proxy in the solver)");
-  }
+  // the same shared transformation the writer context saw (no drift).
+  mutations.push(...applyReplayTransformations(appDir));
 
   // Frozen capture records for in-container seeding + evidence.
   cpSync(join(exportedPackageDir, "capture"), join(environmentDir, "capture"), { recursive: true });

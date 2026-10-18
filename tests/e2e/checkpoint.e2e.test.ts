@@ -340,6 +340,7 @@ describe("S5-R4 writer repair retry across attempts", () => {
       verifierEnv: { OPENAI_API_KEY: "JUDGE_API_KEY", OPENAI_BASE_URL: "JUDGE_BASE_URL" },
       credentials: {},
       modelSpendCapUSD: 0.2,
+      retries: { writer: 3, reviewer: 1 },
     }, null, 2)}\n`);
     // The verifier's judge endpoint is this repair control mock.
     process.env["JUDGE_BASE_URL"] = `http://host.docker.internal:${new URL(repairControlURL).port}/v1`;
@@ -368,11 +369,14 @@ describe("S5-R4 writer repair retry across attempts", () => {
     // The repaired task was published under its own id.
     expect(existsSync(join(scratch, "output", "tasks", job.taskId))).toBe(true);
 
-    // The retry path ran: the smoke rejected attempt 1, the writer repaired
-    // it, and no export collision ever occurred.
+    // The retry path ran through every failure class: the smoke rejected the
+    // unsupported kwarg, the capability guard rejected isolated=True, the
+    // empty provider response was diagnosed precisely, and the repaired
+    // attempt reached validation and finished. No export collision.
     const log = readFileSync(join(jobDirPath, "log.txt"), "utf8");
     expect(log).toContain("criteria smoke failed; retrying the writer");
-    // The repaired attempt reached the fixture validation stage and finished.
+    expect(log).toContain("writer call failed; retrying with the error fed back: checksPy uses isolated=True");
+    expect(log).toContain("finish_reason=stop");
     expect(log).toContain("retrying the writer with the previous validation error");
     expect(log).toContain("step validate: grading known correct and incorrect fixtures");
     expect(log).toMatch(/^[\s\S]*SCORED task=/);
@@ -382,7 +386,8 @@ describe("S5-R4 writer repair retry across attempts", () => {
   }, 1_200_000);
 });
 
-/** Writer returns broken criteria first, repaired criteria on the retry. */
+/** Writer fails three ways, then repairs: unsupported kwarg (smoke),
+ * isolated=True (capability guard), empty content (provider), then good. */
 function repairControlScript(): MockScript {
   const goodChecks = [
     "import rewardkit as rk",
@@ -390,36 +395,44 @@ function repairControlScript(): MockScript {
     "rk.file_contains('repair-marker.txt', 'repair-ok')",
     "",
   ].join("\n");
-  const brokenChecks = [
+  const kwargChecks = [
     "import rewardkit as rk",
     // An unsupported keyword: RewardKit's built-in factories reject anything
     // outside weight/name/isolated at registration time.
     "rk.file_exists('repair-marker.txt', description='bogus-criterion')",
     "",
   ].join("\n");
+  const isolatedChecks = [
+    "import rewardkit as rk",
+    // The verifier cannot provide filesystem isolation (no fuse-overlayfs).
+    "rk.command_succeeds('test -f repair-marker.txt', weight=1.0, isolated=True)",
+    "",
+  ].join("\n");
+  let writerCalls = 0;
   return ({ systemText, firstUserText }) => {
     const prompt = `${systemText}\n${firstUserText}`;
     if (prompt.includes("You convert a failed coding-agent attempt")) {
-      const repaired = firstUserText.includes("previous_attempt_error");
-      return {
-        content: JSON.stringify({
-          taskName: "replay-repair-marker",
-          taskDescription: "The agent must create repair-marker.txt containing the exact marker string.",
-          instructionMd: "Working in /app, create a file named repair-marker.txt containing the exact marker string agreed in the prior conversation. Do not announce the marker in prose.",
-          checksPy: repaired ? goodChecks : brokenChecks,
-          judgeToml: [
-            "[judge]",
-            'judge = "JUDGE_MODEL_PLACEHOLDER"',
-            'files = ["/app/repair-marker.txt"]',
-            "",
-            "[[criterion]]",
-            'description = "The file contains the exact required marker."',
-            'type = "binary"',
-            "",
-          ].join("\n"),
-          solveSh: "printf 'repair-ok' > repair-marker.txt\n",
-        }),
+      writerCalls += 1;
+      const envelope = {
+        taskName: "replay-repair-marker",
+        taskDescription: "The agent must create repair-marker.txt containing the exact marker string.",
+        instructionMd: "Working in /app, create a file named repair-marker.txt containing the exact marker string agreed in the prior conversation. Do not announce the marker in prose.",
+        judgeToml: [
+          "[judge]",
+          'judge = "JUDGE_MODEL_PLACEHOLDER"',
+          'files = ["/app/repair-marker.txt"]',
+          "",
+          "[[criterion]]",
+          'description = "The file contains the exact required marker."',
+          'type = "binary"',
+          "",
+        ].join("\n"),
+        solveSh: "printf 'repair-ok' > repair-marker.txt\n",
       };
+      if (writerCalls === 1) return { content: JSON.stringify({ ...envelope, checksPy: kwargChecks }) };
+      if (writerCalls === 2) return { content: JSON.stringify({ ...envelope, checksPy: isolatedChecks }) };
+      if (writerCalls === 3) return { content: "" }; // provider returned nothing
+      return { content: JSON.stringify({ ...envelope, checksPy: goodChecks }) };
     }
     if (prompt.includes("independent task-quality reviewer")) {
       return {

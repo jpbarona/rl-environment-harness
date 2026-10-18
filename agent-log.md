@@ -972,3 +972,49 @@ R1 PASS · R2 PASS · R3 PASS (writer now sees file contents; breakdown retained
 - Kept: `work/harbor-venv` (332 MB, the pinned Harbor 0.24.0 + RewardKit 0.2.3 environment the runner requires) and `work/live-checkpoint` (972 KB, the only on-disk live-run evidence).
 - Docker: removed the eight agent-created job and smoke images (rl-task-task-001/002 solver + verifier, smoke2-test, smokeprobe2-main, smokeprobe-main, task2__bzpm48y__env-main, about 6 GB) and 1.5 GB of build cache. Left untouched: the user's sim-engine and postgres containers and images, the pinned bases (rl-restore:2.0.18, node:22-bookworm-slim).
 - Repository size after cleanup: 386 MB.
+
+## Entry 028 — live GLM 5.3 Flash failure diagnosed and fixed: verifier capability fit, precise empty-response handling, replay-true writer context
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `checkpoint-live-fixes` (off merged main 1f465a0, PR #4).
+
+### Investigated failure
+
+Job `job-20261018031213-3482` (deployment `/Users/j.p.barona/Code/Projects/RL-test-run`, writer/judge/solver `z-ai/glm-5.3-flash`): attempt 1's criteria failed the smoke with RewardKit's `fuse-overlayfs` error, and the repair call returned empty content, failing the job as `runner.unexpected: model returned empty content`. The frozen capture and the failed job's evidence were preserved untouched. [Citation: `output/jobs/job-20261018031213-3482/{status,log}.json/txt` in that deployment.]
+
+### Fix 1 — criteria must fit the verifier's capabilities (isolated=True)
+
+- Root cause: `rk.command_succeeds(..., isolated=True)` shells out to `fuse-overlayfs` to overlay the workspace. The verifier container is plain `python:3.12-slim` with no fuse tooling, so isolation is unsupported. [Citation: probe run in the verifier image: `RuntimeError: Reward 'checks' failed: Command '['fuse-overlayfs', ...]' returned non-zero exit status 1.`]
+- The writer system prompt now declares the verifier capability profile: no sandbox or overlay tooling, command criteria run directly with /app as the working directory, NEVER `isolated=True`, and built-ins accept only positional args plus weight. `parseWriterOutput` now rejects `isolated=True` at envelope time with a precise message naming the limitation, so the retry loop feeds the exact cause back instead of a fuse traceback. [Citation: `src/checkpoint/writer.ts`; unit test "rejects isolated command criteria the verifier cannot run".]
+
+### Fix 2 — empty provider response: diagnosis + bounded retry
+
+- `chatCompletion` now parses `finish_reason`, `usage.completion_tokens`, `usage.completion_tokens_details.reasoning_tokens`, and the presence of a reasoning block. An empty-content response raises `LlmError("invalid")` carrying all of it, for example `model returned empty content (model=z-ai/glm-5.3-flash, finish_reason=length, completion_tokens=8192, reasoning_tokens=8192)`. Diagnosis context only: no credentials or header material ever enter error text. [Citation: `src/checkpoint/llm.ts`; unit test "reports finish reason and reasoning usage when the model returns empty content" drives a local GLM-shaped response.]
+- The runner's writer loop now treats every non-budget writer-call error (empty content, capability rejection, envelope failure) as a retryable attempt: the precise error is fed back to the next writer call, bounded by the same `1 + retries.writer` budget, and exhaustion fails the job with `writer.retries-exhausted` instead of an unclassified crash. Budget-cap errors still fail immediately. [Citation: the writer loop in `src/checkpoint/runner.ts`.]
+- Diagnosis note for the record: the deployed writer budget is `maxOutputTokens: 8192`; GLM 5.3 Flash is a reasoning hybrid, so a repair call that spends the whole budget reasoning returns empty content with `finish_reason=length`. The failed job's log had no provider body recorded; the response shape was reproduced against the live catalog model (pricing `prompt` 0.000000048/M, `completion` 0.0000002/M) and is covered by the mock-server unit test.
+
+### Fix 3 — the writer sees the ACTUAL replay workspace
+
+- The runner now materializes the replay starting workspace ONCE per job (`<jobDir>/replay-workspace`) and applies the SAME recorded runtime transformations the task builder applies (provider/model scrub from opencode.json, capture-plugin removal), extracted into shared `applyReplayTransformations` so the two can never drift. `workspaceExcerpts` now reads from that materialized directory (previously the raw pre-transform object store), and the writer payload carries `replay_transformations` listing what was changed. The prompt states preservation criteria may only require files that appear in `workspace_files`, with the content shown. [Citation: `applyReplayTransformations` in `src/checkpoint/harbor-task.ts`; the materialization + writer-input block in `runPipeline`; unit test "the writer prompt declares verifier capabilities, preservation rules, and the replay transformations".]
+
+### Regression tests
+
+- Unit (`tests/checkpoint/checkpoint.test.ts`): the isolated=True envelope rejection; the capability + preservation prompt assertions with `replay_transformations`; the empty-content precision test. Suite: 115 passed.
+- E2E (`tests/e2e/checkpoint.e2e.test.ts`, "S5-R4 writer repair retry across attempts") now drives FOUR writer calls in one job: unsupported kwarg (caught by the criteria smoke), isolated=True (caught by the capability guard), empty content (diagnosed precisely and retried), then repaired criteria. The job reaches fixture validation, native Harbor, review, and SCORED with reward 1.0 and spend 0, one export package, no `target-exists`. Suite: 6 passed (206 s). [Citation: the describe in the e2e file.]
+
+### Real GLM 5.3 Flash re-run (deployment, same preserved capture)
+
+- Queue: job `job-20261018032806-gg03`, task `task-002`, checkpoint `ckpt-a1b0b45a3699` (the preserved frozen capture; selected directly because the capture proxy resolves attempts from in-memory session state and a fresh proxy has none; the job record + detached runner path is identical to the CLI's, and the store was only ever read). Description: "The agent never created hello.txt containing exactly hello, and no other file may change."
+- Pipeline: attempt 1 failed the criteria smoke (RewardKit programmatic-construction error, fed back); attempt 2 produced clean criteria. Solver image built, fixtures validated, native Harbor trial ran with the replayed session (`opencode run ... --model openrouter/z-ai/glm-5.3-flash`), Mean 1.000 in 1m52s, agent cost $0.000329, ATIF trajectory present. [Citation: `output/jobs/job-20261018032806-gg03/log.txt`, `harbor/validation/task__hVCVDSE/result.json` in the deployment.]
+- Generated criteria (published task): `rk.file_exists` + `rk.file_contains` on README.md (a file that EXISTS in the replay workspace), an exact-content criterion for hello.txt, and NO capture-plugin requirement and NO isolated=True. [Citation: `output/tasks/task-002/tests/checks.py` in the deployment.]
+- Review: overall 83/100 (D1 95, D2 90, D3 90, D4 70, D5 60, D6 95), rubric `universal-task-quality-v1`, retained in `status.json` and `review.json`. The reviewer's own finding stands in the notes: the criteria give free credit for inaction (the file-exists + exact-content checks alone cannot distinguish an agent that wrote the file from one that copied it into place without the requested method) — recorded, not suppressed. [Citation: `output/tasks/task-002/review.json`.]
+- Spend: status records $0.0011 actual, $0 estimated, cap $0.20 (the writer emitted no judge TOML this run, so no judge calls were reserved; the Harbor agent's $0.000329 is recorded in the trial result). [Citation: `status.json`.]
+
+### Deployment note
+
+- The deployment checkout (`RL-test-run/harness`) runs the fixed build: `dist/` and `src/` were synced from this branch after the fixes. Its git worktree shows those files modified until the branch merges; the authoritative source and agent-log live in this repository.
+
+### Remaining gaps
+
+1. Reviewer-identified grading weakness (D5 60): the generated criteria cannot distinguish the requested method from any file placement achieving the outcome. A stricter rubric or method-aware criteria is a future writer-quality improvement, not a pipeline defect.
+2. The Harbor trial directory name is `task__hVCVDSE` in this run versus `task-001` in the deterministic e2e (Harbor-generated trial ids vary); the runner's `findTrialDir` glob handles both.
+3. Live capture-driven re-selection still requires the proxy's in-memory session (by design, S5-R1 identity); the direct job-record path used here applies only when repeating a preserved capture.

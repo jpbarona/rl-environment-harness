@@ -27,6 +27,11 @@ export interface WriterInput {
   readonly workspaceFiles: readonly WorkspaceFileExcerpt[];
   readonly attemptExcerpt: string;
   readonly judgeModelPlaceholder: string;
+  /**
+   * Recorded runtime transformations applied to the materialized replay
+   * workspace before the writer sees it (provider scrub, plugin removal).
+   */
+  readonly replayTransformations?: readonly string[];
   /** The previous attempt's validation error, fed back on retry. */
   readonly previousError?: string;
 }
@@ -65,10 +70,17 @@ You produce a JSON object with EXACTLY these keys:
   starting workspace into a CORRECT solution state (idempotent, no network).
 
 Rules: the success criteria must check the OUTCOME the user wanted, not the agent's
-prose. The RewardKit API is strict: built-in calls accept ONLY their positional
-arguments plus weight (and isolated for command criteria); @criterion accepts ONLY
-description and shared. NEVER pass name=, description= to a built-in call, or any
-other keyword. Output ONLY the JSON object, no markdown fence.`;
+prose. The verifier runs RewardKit in a plain Python container with NO sandbox or
+overlay tooling: command criteria execute directly with /app as their working
+directory. NEVER pass isolated=True to any command criterion (the verifier cannot
+provide filesystem isolation; the criteria smoke rejects the attempt). Built-in
+calls accept ONLY their positional arguments plus weight; @criterion accepts ONLY
+description and shared. NEVER pass name=, description=, or any other keyword to a
+built-in call. workspace_files lists the EXACT files present in /app at task
+start, after the recorded runtime transformations listed in
+replay_transformations. Preservation criteria may only require files that appear
+in workspace_files, and only the content shown there. Output ONLY the JSON
+object, no markdown fence.`;
 
 export function buildWriterMessages(input: WriterInput): ChatMessage[] {
   const payload: Record<string, unknown> = {
@@ -79,6 +91,9 @@ export function buildWriterMessages(input: WriterInput): ChatMessage[] {
     original_attempt_excerpt: input.attemptExcerpt,
     judge_model_placeholder: input.judgeModelPlaceholder,
   };
+  if (input.replayTransformations !== undefined && input.replayTransformations.length > 0) {
+    payload["replay_transformations"] = input.replayTransformations;
+  }
   if (input.previousError !== undefined) {
     payload["previous_attempt_error"] = input.previousError;
     payload["fix_required"] = "Your previous checksPy failed to run with the error above. Fix checksPy so RewardKit accepts it.";
@@ -120,6 +135,12 @@ export function parseWriterOutput(text: string): WriterOutput {
   const checksPy = str("checksPy");
   if (!checksPy.includes("rk.") && !checksPy.includes("@criterion")) {
     throw new LlmError("invalid", "checksPy registers no RewardKit criteria");
+  }
+  if (/\bisolated\s*=\s*True\b/.test(checksPy)) {
+    throw new LlmError(
+      "invalid",
+      "checksPy uses isolated=True on a command criterion; the configured verifier cannot provide filesystem isolation (no fuse-overlayfs in the container). Use the default isolated=False so the command runs directly in the graded workspace, or use file criteria.",
+    );
   }
   const judgeRaw = o["judgeToml"];
   let judgeToml: string | null = null;

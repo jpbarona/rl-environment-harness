@@ -17,7 +17,9 @@ import { loadConfig, type SystemConfig } from "./config.js";
 import { appendJobLog, jobDir, markFailed, readStatus, writeStatus, type JobRecord, type JobStatus } from "./job.js";
 import { runWriter, type WriterOutput } from "./writer.js";
 import { runReviewer, type ReviewResult } from "./reviewer.js";
-import { buildHarborTask, exportFrozenCapture } from "./harbor-task.js";
+import { applyReplayTransformations, buildHarborTask, exportFrozenCapture } from "./harbor-task.js";
+import { materializeWorkspace } from "../restore/materialize.js";
+import type { WorkspaceSnapshot } from "../capture/snapshot.js";
 import { SpendTracker, LlmError } from "./llm.js";
 import { readJsonl } from "./jsonl.js";
 
@@ -86,7 +88,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     const messages = primary.body.messages ?? [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     const selectedPrompt = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
-    const manifest = JSON.parse(readFileSync(join(recordsDir, "manifest.json"), "utf8")) as { files: Array<{ path: string; kind: string; sha256?: string; size?: number }> };
+    const manifest = JSON.parse(readFileSync(join(recordsDir, "manifest.json"), "utf8")) as WorkspaceSnapshot;
     const priorContext = JSON.parse(readFileSync(join(recordsDir, "prior_context.json"), "utf8")) as { priorMessages: Array<{ role: string; content: unknown }> };
     const priorExcerpt = priorContext.priorMessages
       .slice(-6)
@@ -96,13 +98,23 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
       .slice(-3)
       .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content.slice(0, 400) : "[structured content]"}`)
       .join("\n");
+    // Materialize the ACTUAL replay starting workspace once (writer-retry
+    // fix, file-preservation fix): the writer must see the files exactly as
+    // the solver will, including the recorded runtime transformations, not
+    // the raw pre-transform snapshot.
+    step("writer", "materializing the replay starting workspace");
+    const replayDir = join(dir, "replay-workspace");
+    rmSync(replayDir, { recursive: true, force: true });
+    materializeWorkspace(config.storePath, manifest, replayDir);
+    const replayTransformations = applyReplayTransformations(replayDir);
     const writerInput = {
       description: record.description,
       selectedPrompt: selectedPrompt.slice(0, 4000),
       priorContextExcerpt: priorExcerpt.slice(0, 4000),
-      workspaceFiles: workspaceExcerpts(config.storePath, manifest),
+      workspaceFiles: workspaceExcerpts(replayDir, manifest),
       attemptExcerpt: attemptExcerpt.slice(0, 2000),
       judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
+      replayTransformations,
     };
     const solverTag = `rl-task-${record.taskId}-solver`;
     const verifierTag = `rl-task-${record.taskId}-verifier`;
@@ -125,12 +137,28 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     const writerAttempts = 1 + config.retries.writer;
     for (let attempt = 1; attempt <= writerAttempts; attempt += 1) {
       step("writer", attempt === 1 ? "generating task definition from the frozen capture" : `retrying the writer with the previous validation error`);
-      writer = await runWriter(
-        config.writer,
-        { ...writerInput, ...(previousError !== undefined ? { previousError } : {}) },
-        spend,
-        { timeoutMs: config.timeouts.writerMs, retries: 0 },
-      );
+      // Writer-call failures (empty content, capability rejection, envelope
+      // errors) consume an attempt and feed the precise error back, bounded
+      // by the same writer budget. Budget-cap errors still fail immediately.
+      try {
+        writer = await runWriter(
+          config.writer,
+          { ...writerInput, ...(previousError !== undefined ? { previousError } : {}) },
+          spend,
+          { timeoutMs: config.timeouts.writerMs, retries: 0 },
+        );
+      } catch (err) {
+        if (err instanceof LlmError && err.kind === "budget") {
+          throw err;
+        }
+        const detail = String(err instanceof Error ? err.message : err);
+        previousError = detail.slice(-800);
+        if (attempt === writerAttempts) {
+          return fail("writer.retries-exhausted", `the writer produced no usable task definition: ${detail.slice(0, 300)}`);
+        }
+        log(`writer call failed; retrying with the error fed back: ${detail.slice(0, 200)}`);
+        continue;
+      }
       step("build", "assembling the Harbor task from the frozen capture");
       built = buildHarborTask({ config, jobDir: dir, checkpointId: record.checkpointId, exportedPackageDir, writer, repoRoot: repoRoot() });
       update({ detail: `task assembled; ${built.mutations.length} recorded runtime rebinds` });
@@ -332,7 +360,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
 /** Bounded file-content excerpts for the writer (S5-R3 gap fix). */
 const EXCERPT_PRIORITY = [".md", ".py", ".ts", ".js", ".json", ".toml", ".yaml", ".yml", ".sh", ".txt"];
 
-function workspaceExcerpts(storeRoot: string, manifest: { files: Array<{ path: string; kind: string; sha256?: string; size?: number }> }): Array<{ path: string; bytes: number; excerpt: string }> {
+function workspaceExcerpts(replayDir: string, manifest: { files: Array<{ path: string; kind: string; sha256?: string; size?: number }> }): Array<{ path: string; bytes: number; excerpt: string }> {
   const MAX_FILES = 24;
   const MAX_TOTAL_CHARS = 24_000;
   const PER_FILE_CHARS = 2048;
@@ -353,7 +381,7 @@ function workspaceExcerpts(storeRoot: string, manifest: { files: Array<{ path: s
       break;
     }
     try {
-      const content = readFileSync(join(storeRoot, "objects", file.sha256!), "utf8");
+      const content = readFileSync(join(replayDir, file.path), "utf8");
       const excerpt = content.slice(0, PER_FILE_CHARS);
       total += excerpt.length;
       out.push({ path: file.path, bytes: content.length, excerpt });

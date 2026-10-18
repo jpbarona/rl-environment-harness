@@ -4,13 +4,14 @@
  */
 import { describe, expect, it, beforeAll } from "vitest";
 import { spawnSync } from "node:child_process";
+import * as http from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, ConfigError } from "../../src/checkpoint/config.js";
 import { createJob, isRunnerAlive, listJobs, markFailed, readStatus, writeStatus, type JobStatus } from "../../src/checkpoint/job.js";
-import { SpendTracker, LlmError } from "../../src/checkpoint/llm.js";
+import { SpendTracker, LlmError, chatCompletion } from "../../src/checkpoint/llm.js";
 import { parseWriterOutput, buildWriterMessages } from "../../src/checkpoint/writer.js";
 import { parseReviewerOutput } from "../../src/checkpoint/reviewer.js";
 import { buildHarborTask, exportFrozenCapture } from "../../src/checkpoint/harbor-task.js";
@@ -106,6 +107,38 @@ describe("S5 job state and crash sweep", () => {
   });
 });
 
+describe("S5 provider response diagnostics", () => {
+  it("reports finish reason and reasoning usage when the model returns empty content", async () => {
+    const server = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (chunk: Buffer) => raw += String(chunk));
+      req.on("end", () => {
+        expect(raw).toContain("z-ai/glm-5.3-flash");
+        res.setHeader("content-type", "application/json");
+        // GLM-shaped reasoning-model response: all completion budget spent
+        // on reasoning, no content, finish_reason length.
+        res.end(JSON.stringify({
+          model: "z-ai/glm-5.3-flash",
+          choices: [{ finish_reason: "length", message: { content: "", reasoning: "long thinking trace" } }],
+          usage: { prompt_tokens: 3200, completion_tokens: 8192, completion_tokens_details: { reasoning_tokens: 8192 }, cost: null },
+        }));
+      });
+    });
+    await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+    const port = (server.address() as { port: number }).port;
+    process.env["WRITER_API_KEY"] = "unit-test-key";
+    try {
+      await expect(chatCompletion(
+        { baseURL: `http://127.0.0.1:${port}`, model: "z-ai/glm-5.3-flash", apiKeyEnv: "WRITER_API_KEY", maxOutputTokens: 8192 },
+        [{ role: "user", content: "produce the envelope" }],
+        { timeoutMs: 5000 },
+      )).rejects.toThrow(/empty content \(model=z-ai\/glm-5\.3-flash, finish_reason=length, completion_tokens=8192, reasoning_tokens=8192\)/);
+    } finally {
+      await new Promise((ok) => server.close(ok));
+    }
+  });
+});
+
 describe("S5 spend cap", () => {
   it("admits free-model calls, records actuals, tracks estimates, and fails the job when the cap is exceeded", async () => {
     const { estimateCostFromTokens } = await import("../../src/checkpoint/llm.js");
@@ -177,6 +210,29 @@ describe("S5 writer and reviewer envelopes", () => {
     expect(() => parseWriterOutput(validWriter.replace('"fix-greeting"', '"Fix Greeting"'))).toThrow(/kebab-case/);
     expect(() => parseWriterOutput(validWriter.replace("rk.file_contains", "x"))).toThrow(/no RewardKit criteria/);
     expect(() => parseWriterOutput(validWriter.replace("null", '"[judge]"'))).toThrow(/JUDGE_MODEL_PLACEHOLDER/);
+  });
+
+  it("rejects isolated command criteria the verifier cannot run", () => {
+    // The verifier container has no fuse-overlayfs: isolated=True cannot
+    // provide the filesystem isolation it promises (observed live failure).
+    const isolated = validWriter.replace(
+      "rk.file_contains('hello.txt', 'hi')",
+      "rk.command_succeeds('cat hello.txt', weight=1.0, isolated=True)",
+    );
+    expect(() => parseWriterOutput(isolated)).toThrow(/isolated=True.*isolation/s);
+  });
+
+  it("the writer prompt declares verifier capabilities, preservation rules, and the replay transformations", () => {
+    const messages = buildWriterMessages({
+      description: "did not do x", selectedPrompt: "do x", priorContextExcerpt: "user: do x",
+      workspaceFiles: [{ path: "a.txt", bytes: 32, excerpt: "counter = 1" }], attemptExcerpt: "assistant: ok", judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
+      replayTransformations: ["removed the capture plugin from the baked workspace (no recorder proxy in the solver)"],
+    });
+    expect(messages[0]?.content).toContain("isolated=True");
+    expect(messages[0]?.content).toContain("Preservation criteria");
+    const user = messages[1]?.content ?? "";
+    expect(user).toContain("replay_transformations");
+    expect(user).toContain("capture plugin");
   });
 
   it("the writer prompt carries the failure description, capture context, and file excerpts", () => {
