@@ -929,3 +929,37 @@ R1 PASS (quoted description, active-session identity selection via `/checkpoint`
 R1 PASS · R2 PASS · R3 PASS (writer now sees file contents; breakdown retained; real-model criteria quality improves with the smoke-retry loop) · R4 PASS · R5 PASS (solution isolation + retag detection close the review findings) · R6 PASS · R7 PASS in code; the real-provider run is BLOCKED by the OpenRouter account data policy (evidence above; the opt-in test is ready for one manual run once the policy allows free endpoints) · R8 PASS.
 
 **Next step:** Step 6 — VM deployment, after one authorized live run (free endpoints unblocked or a paid-model authorisation).
+
+## Entry 026 — writer-retry export collision fixed, verified export reused across attempts
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `step-5`.
+
+### The bug
+
+- Each writer attempt called `buildHarborTask`, which ran the Step 4 exporter into the same `<jobDir>/export` root every time. The exporter publishes exactly one package per export root and refuses to overwrite, so the SECOND writer attempt (the criteria-repair retry added in Entry 025) died inside `exportPackage` with `package.target-exists`, surfaced by the runner as `runner.unexpected`. [Citation: the old export block in `src/checkpoint/harbor-task.ts` `buildHarborTask`; the guard at `src/package/export.ts` line 312.]
+
+### The fix (reuse the verified frozen export)
+
+- New `exportFrozenCapture` in `src/checkpoint/harbor-task.ts`: the Step 4 export (with its package validation) runs ONCE per job, before the writer loop, and every attempt consumes the same verified `packageDir`. Re-exports are gone, so no attempt can collide. The source store and the selected checkpoint stay read-only, and the frozen capture is exported exactly once per job dir. [Citation: `exportFrozenCapture` + the `exportedPackageDir` option on `buildHarborTask`; the export step in `runPipeline` (`src/checkpoint/runner.ts`) before the writer loop.]
+- The criteria smoke now inherits the verifier env (`verifierEnvArgs`, shared with `gradeFixture`). Without it, any task with a judge.toml failed the smoke because RewardKit's judge client saw no `OPENAI_API_KEY`/`OPENAI_BASE_URL`. [Citation: the smoke `docker run` in `runPipeline`.]
+- Removed the redundant pre-loop "generating task definition" status line so the log reads export -> generate.
+
+### Regression tests (both new, both passing)
+
+1. Unit (`tests/checkpoint/checkpoint.test.ts`, "reuses the verified export across rebuilds"): export once, then TWO `buildHarborTask` calls with different writer outputs. Both succeed, the first draft carried writer 1's checks.py, the rebuild carries writer 2's, and the export root still holds exactly ONE package. [Citation: the test body.]
+2. E2E (`tests/e2e/checkpoint.e2e.test.ts`, "S5-R4 writer repair retry across attempts"): the control mock returns criteria with an unsupported keyword (`description=`) on attempt 1 and repaired criteria on attempt 2, keyed on `previous_attempt_error`. Assertions: the smoke rejected attempt 1 ("criteria smoke failed; retrying the writer"), the repaired attempt reached fixture validation and the native Harbor run, the job SCORED with solverReward 1.0 and spend 0, the log contains no `target-exists`, the job's export dir holds exactly one package, and the repaired task published under its own task id (the retry config shares the output dir so the job gets task-002 and its own image tags, avoiding a containerd snapshot race when rebuilding the same tags inside one test run). [Citation: the describe "S5-R4 writer repair retry across attempts"; job log of the passing run under `work/e2e/checkpoint-fixture-*/checkpoint-retry-scratch/output/jobs/`.]
+
+### RewardKit behavior recorded while building the test
+
+- Built-in criterion factories ACCEPT the `name=` kwarg (the wrapper consumes it) and per-criterion evaluation errors are swallowed with a warning and reward 0 while `reward.json` is still written. Kwarg errors that DO fail a run are registration-time TypeErrors: any keyword outside weight/name/isolated (for example `description=`) raises inside `_bind_factory_args` and rewardkit exits nonzero with no reward.json. The earlier live failure (`criterion() got an unexpected keyword argument 'name'`) was the decorator path, which raises at import. The smoke detects the raising class by exit status and reward.json absence. [Citation: `session.py` factory signature in the pinned harbor-rewardkit 0.2.3; probe runs against the verifier image, EXIT=0 with reward 0.0 for `name=`, EXIT=1 TypeError for `description=`.]
+
+### Verification
+
+1. `npx tsc --noEmit` — exit 0. `npm run -s build` — exit 0.
+2. `npm test` — 10 files, 112 passed (adds the export-reuse regression).
+3. `npm run test:checkpoint-e2e` — 6 passed, 205 s (adds the writer-repair e2e; the original 5 still pass on the fixed pipeline).
+4. Restore e2e and package e2e not re-run: no restore or exporter code changed (export.ts untouched, restore/ untouched).
+
+### Remaining live-provider validation gap (unchanged from Entry 025)
+
+- The opt-in live test is ready but blocked by the OpenRouter account, not by code: every free-model endpoint returns HTTP 404 "0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy" (8 provider families probed with full errors). One manual run of `tests/live/checkpoint.live.test.ts` after the account's data-policy setting allows free endpoints (or with an authorized paid model) closes the gap.

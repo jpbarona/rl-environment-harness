@@ -39,11 +39,39 @@ interface RequestRecord {
   readonly body: { readonly messages?: Array<{ role: string; content?: unknown }> };
 }
 
+/**
+ * Export the frozen capture ONCE per job (writer-retry fix): the Step 4
+ * package is produced and package-validated a single time and every writer
+ * attempt reuses it. The exporter publishes exactly one package per export
+ * root, so re-exporting per attempt would collide with
+ * package.target-exists on the first retry. The source store is only ever
+ * READ; the selected checkpoint and the store are never modified.
+ */
+export function exportFrozenCapture(options: {
+  readonly config: SystemConfig;
+  readonly jobDir: string;
+  readonly checkpointId: string;
+  readonly repoRoot: string;
+}): string {
+  const exported = exportPackage({
+    storeRoot: options.config.storePath,
+    checkpointId: options.checkpointId,
+    outputDir: join(options.jobDir, "export"),
+    repoRoot: options.repoRoot,
+  });
+  if (exported.status !== "PASS" || exported.packageDir === undefined) {
+    throw new Error(`Step 4 export failed: ${exported.checks.filter((c) => !c.ok).map((c) => c.check).join(", ")}`);
+  }
+  return exported.packageDir;
+}
+
 /** Build the Harbor task draft under <jobDir>/task. */
 export function buildHarborTask(options: {
   readonly config: SystemConfig;
   readonly jobDir: string;
   readonly checkpointId: string;
+  /** The verified Step 4 export produced once per job by exportFrozenCapture. */
+  readonly exportedPackageDir: string;
   readonly writer: WriterOutput;
   readonly repoRoot: string;
 }): BuiltTask {
@@ -71,17 +99,10 @@ export function buildHarborTask(options: {
   };
   const prompt = selectedTurnInput(primary.body).prompt;
 
-  // Step 4 export for provenance: capture/ records + evidence split.
-  const exportRoot = join(jobDir, "export");
-  const exported = exportPackage({
-    storeRoot: config.storePath,
-    checkpointId,
-    outputDir: exportRoot,
-    repoRoot,
-  });
-  if (exported.status !== "PASS" || exported.packageDir === undefined) {
-    throw new Error(`Step 4 export failed: ${exported.checks.filter((c) => !c.ok).map((c) => c.check).join(", ")}`);
-  }
+  // The verified Step 4 export was produced ONCE per job by
+  // exportFrozenCapture and is consumed here per attempt; re-exporting per
+  // attempt would collide with the exporter's one-package-per-root rule.
+  const exportedPackageDir = options.exportedPackageDir;
 
   const mutations: string[] = [];
 
@@ -112,7 +133,7 @@ export function buildHarborTask(options: {
   }
 
   // Frozen capture records for in-container seeding + evidence.
-  cpSync(join(exported.packageDir, "capture"), join(environmentDir, "capture"), { recursive: true });
+  cpSync(join(exportedPackageDir, "capture"), join(environmentDir, "capture"), { recursive: true });
   writeFileSync(join(environmentDir, "capture", "selected.json"), `${JSON.stringify({
     checkpointId,
     sessionId: runtime.sessionId,
@@ -153,10 +174,10 @@ export function buildHarborTask(options: {
   writeFileSync(join(taskDir, "task.toml"), taskToml(writer, config));
 
   // --- evidence/: the original attempt suffix, outside replay context. ---
-  cpSync(join(exported.packageDir, "evidence"), join(taskDir, "evidence"), { recursive: true });
+  cpSync(join(exportedPackageDir, "evidence"), join(taskDir, "evidence"), { recursive: true });
 
   // --- capture/ at the task root: frozen capture provenance. ---
-  cpSync(join(exported.packageDir, "capture"), join(taskDir, "capture"), { recursive: true });
+  cpSync(join(exportedPackageDir, "capture"), join(taskDir, "capture"), { recursive: true });
 
   writeFileSync(join(taskDir, "build-report.json"), `${JSON.stringify({
     builtAt: new Date().toISOString(),

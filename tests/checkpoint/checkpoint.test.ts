@@ -13,7 +13,7 @@ import { createJob, isRunnerAlive, listJobs, markFailed, readStatus, writeStatus
 import { SpendTracker, LlmError } from "../../src/checkpoint/llm.js";
 import { parseWriterOutput, buildWriterMessages } from "../../src/checkpoint/writer.js";
 import { parseReviewerOutput } from "../../src/checkpoint/reviewer.js";
-import { buildHarborTask } from "../../src/checkpoint/harbor-task.js";
+import { buildHarborTask, exportFrozenCapture } from "../../src/checkpoint/harbor-task.js";
 import { snapshotWorkspace } from "../../src/capture/snapshot.js";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -238,10 +238,12 @@ describe("S5 deterministic task builder", () => {
     const config = loadConfig(writeConfig(root, { storePath: store }));
     const jobDir = join(root, "job");
     mkdirSync(jobDir, { recursive: true });
+    const exportedPackageDir = exportFrozenCapture({ config, jobDir, checkpointId: ckpt, repoRoot });
     const built = buildHarborTask({
       config,
       jobDir,
       checkpointId: ckpt,
+      exportedPackageDir,
       writer: {
         taskName: "fix-greeting",
         taskDescription: "Write the greeting file.",
@@ -298,6 +300,33 @@ describe("S5 deterministic task builder", () => {
     expect(existsSync(join(task, "evidence", "model_requests.jsonl"))).toBe(true);
     // The Step 4 export record exists beside the task.
     expect(existsSync(join(jobDir, "export", `task-${ckpt}`))).toBe(true);
+  });
+
+  it("reuses the verified export across rebuilds: two writer attempts, one package, no collision", () => {
+    const config = loadConfig(writeConfig(root, { storePath: store }));
+    const jobDir = join(root, "job-retry");
+    mkdirSync(jobDir, { recursive: true });
+    // The frozen capture is exported exactly once for the job.
+    const exportedPackageDir = exportFrozenCapture({ config, jobDir, checkpointId: ckpt, repoRoot });
+    const firstWriter = {
+      taskName: "fix-greeting",
+      taskDescription: "Write the greeting file.",
+      instructionMd: "Create selected-output.txt with selected-result.",
+      checksPy: "import rewardkit as rk\nrk.file_contains('selected-output.txt', 'selected-result')\n",
+      judgeToml: null,
+      solveSh: "printf selected-result > selected-output.txt\n",
+    };
+    // A repaired second attempt: different criteria, same frozen export.
+    const repairedWriter = { ...firstWriter, taskName: "fix-greeting-2", checksPy: "import rewardkit as rk\nrk.file_exists('selected-output.txt')\n" };
+    const first = buildHarborTask({ config, jobDir, checkpointId: ckpt, exportedPackageDir, writer: firstWriter, repoRoot });
+    // The rebuilt draft replaces the first attempt's task directory.
+    const firstChecks = readFileSync(join(first.taskDir, "tests", "checks.py"), "utf8");
+    const second = buildHarborTask({ config, jobDir, checkpointId: ckpt, exportedPackageDir, writer: repairedWriter, repoRoot });
+    expect(firstChecks).toBe(firstWriter.checksPy);
+    expect(readFileSync(join(second.taskDir, "tests", "checks.py"), "utf8")).toBe(repairedWriter.checksPy);
+    // The export root still holds exactly ONE published package: the second
+    // attempt reused it instead of colliding with package.target-exists.
+    expect(readdirSync(join(jobDir, "export"))).toEqual([`task-${ckpt}`]);
   });
 
   it("solver container replays the captured session end-to-end (real OpenCode, real Harbor)", { timeout: 900_000 }, () => {

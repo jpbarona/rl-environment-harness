@@ -1,7 +1,8 @@
 /**
  * Background checkpoint pipeline (S5-R2..S5-R8).
  *
- * Runs detached from the OpenCode session: writer -> task build ->
+ * Runs detached from the OpenCode session: the frozen capture is exported
+ * once, then writer -> task build (reusing that verified export) ->
  * image builds + known good/bad verifier validation -> native Harbor run
  * with the replayed captured attempt -> independent quality review ->
  * atomic publication. Every transition is persisted to status.json so a
@@ -16,7 +17,7 @@ import { loadConfig, type SystemConfig } from "./config.js";
 import { appendJobLog, jobDir, markFailed, readStatus, writeStatus, type JobRecord, type JobStatus } from "./job.js";
 import { runWriter, type WriterOutput } from "./writer.js";
 import { runReviewer, type ReviewResult } from "./reviewer.js";
-import { buildHarborTask } from "./harbor-task.js";
+import { buildHarborTask, exportFrozenCapture } from "./harbor-task.js";
 import { SpendTracker, LlmError } from "./llm.js";
 import { readJsonl } from "./jsonl.js";
 
@@ -76,7 +77,6 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
   const spend = new SpendTracker(config.modelSpendCapUSD);
   try {
     // --- Writer (S5-R3). ---
-    step("writer", "generating task definition from the frozen capture");
     const recordsDir = join(config.storePath, "checkpoints", record.checkpointId);
     const requests = readJsonl<{ index: number; classification: string; body: { messages?: Array<{ role: string; content?: unknown }> } }>(join(recordsDir, "model_requests.jsonl"));
     const primary = requests.find((r) => r.classification === "task-new-turn" || r.classification === "task-continuation");
@@ -107,6 +107,14 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     const solverTag = `rl-task-${record.taskId}-solver`;
     const verifierTag = `rl-task-${record.taskId}-verifier`;
 
+    // Export the frozen capture ONCE (writer-retry fix): the verified Step 4
+    // package is produced a single time and reused by every writer attempt.
+    // Re-exporting per attempt would fail with package.target-exists on the
+    // first retry, because the exporter publishes exactly one package per
+    // export root. The store and the selected checkpoint stay read-only.
+    step("writer", "exporting the verified frozen capture package");
+    const exportedPackageDir = exportFrozenCapture({ config, jobDir: dir, checkpointId: record.checkpointId, repoRoot: repoRoot() });
+
     // Writer + build + criteria smoke, with the validation error fed back to
     // the writer on retry (bounded). Real models invent unsupported API calls;
     // the smoke catches them before any fixture or Harbor spend.
@@ -124,7 +132,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
         { timeoutMs: config.timeouts.writerMs, retries: 0 },
       );
       step("build", "assembling the Harbor task from the frozen capture");
-      built = buildHarborTask({ config, jobDir: dir, checkpointId: record.checkpointId, writer, repoRoot: repoRoot() });
+      built = buildHarborTask({ config, jobDir: dir, checkpointId: record.checkpointId, exportedPackageDir, writer, repoRoot: repoRoot() });
       update({ detail: `task assembled; ${built.mutations.length} recorded runtime rebinds` });
       step("build", "building the verifier image");
       const verifierBuild = runDocker(["build", "--platform", "linux/arm64", "-t", verifierTag, join(built.taskDir, "tests")], 900_000);
@@ -136,6 +144,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
       const smoke = runDocker([
         "run", "--rm", "--platform", "linux/arm64",
         "-v", `${join(built.taskDir, "tests")}:/tests:ro`,
+        ...verifierEnvArgs(config),
         verifierTag,
         "bash", "-c", "mkdir -p /tmp/ws /tmp/out && rewardkit /tests --workspace /tmp/ws --output /tmp/out/reward.json >/dev/null 2>/tmp/smoke-err.txt; cat /tmp/smoke-err.txt >&2; test -s /tmp/out/reward.json",
       ], 300_000);
@@ -489,20 +498,29 @@ function validateFixtures(options: {
   return { ok: true, goodReward: good.reward, badReward: bad.reward, detail: "ok" };
 }
 
+/** Host -> container env pairs for verifier containers (smoke + fixtures). */
+function verifierEnvArgs(config: SystemConfig): string[] {
+  const envArgs: string[] = [];
+  for (const [container, host] of Object.entries(config.verifierEnv)) {
+    const value = process.env[host];
+    if (value !== undefined && value !== "") {
+      envArgs.push("-e", `${container}=${value}`);
+    }
+  }
+  return envArgs;
+}
+
 /** Run the verifier image against a fixture workspace; returns the reward or a diagnostic. */
 function gradeFixture(verifierTag: string, fixtureDir: string, config: SystemConfig): { reward: number | null; exit: number; diagnostic: string } {
   const logsDir = `${fixtureDir}-verifier-logs`;
   rmSync(logsDir, { recursive: true, force: true });
   mkdirSync(logsDir, { recursive: true });
-  const envArgs: string[] = [];
   const envNames: string[] = [];
   for (const [container, host] of Object.entries(config.verifierEnv)) {
     const value = process.env[host];
     envNames.push(`${container}<-${host}(${value === undefined || value === "" ? "MISSING" : "set"})`);
-    if (value !== undefined && value !== "") {
-      envArgs.push("-e", `${container}=${value}`);
-    }
   }
+  const envArgs = verifierEnvArgs(config);
   const result = runDocker([
     "run", "--rm", "--platform", "linux/arm64",
     "-v", `${fixtureDir}:/app`,

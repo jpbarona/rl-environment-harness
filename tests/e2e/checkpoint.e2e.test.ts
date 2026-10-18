@@ -160,13 +160,13 @@ function solverScript(): MockScript {
   };
 }
 
-function runCli(args: readonly string[]): Promise<{ status: number; stdout: string; stderr: string }> {
+function runCli(args: readonly string[], configPath: string = join(scratch, "checkpoint.config.json")): Promise<{ status: number; stdout: string; stderr: string }> {
   return new Promise((resolveRun) => {
     const child = spawn("node", [cli, ...args], {
       env: {
         ...process.env,
         PATH: HOST_PATH,
-        CHECKPOINT_CONFIG: join(scratch, "checkpoint.config.json"),
+        CHECKPOINT_CONFIG: configPath,
         WRITER_API_KEY: "mock-writer-key",
         REVIEWER_API_KEY: "mock-reviewer-key",
         SOLVER_API_KEY: "mock-solver-key",
@@ -295,6 +295,163 @@ describe("S5-R5 solver and verifier isolation", () => {
     expect(appEntry?.status).not.toBe("empty");
   }, 60_000);
 });
+
+/**
+ * S5 writer-retry regression: the first writer response emits criteria the
+ * verifier rejects; the retry (fed the validation error) repairs them. The
+ * frozen capture is exported once per job, so the second attempt must reach
+ * validation and complete WITHOUT a package.target-exists collision.
+ */
+describe("S5-R4 writer repair retry across attempts", () => {
+  let retryScratch: string;
+  let retryConfigPath: string;
+  let repairControlURL = "";
+  let repairSolverURL = "";
+  let cleanups2: Array<() => Promise<void>> = [];
+
+  beforeAll(async () => {
+    // Writer/reviewer/judge mock: the writer returns broken criteria on the
+    // first call and the repaired criteria once the retry carries the
+    // validation error (previous_attempt_error).
+    const repairControl = new MockModelServer(repairControlScript());
+    repairControlURL = await repairControl.start();
+    cleanups2.push(() => repairControl.stop());
+    // Solver mock: the replayed captured request (turn 3) gets the tool call
+    // that recreates the graded file.
+    const repairSolver = new MockModelServer(repairSolverScript());
+    repairSolverURL = (await repairSolver.start()).replace("127.0.0.1", "host.docker.internal");
+    cleanups2.push(() => repairSolver.stop());
+
+    retryScratch = join(env.runDir, "checkpoint-retry-scratch");
+    mkdirSync(retryScratch, { recursive: true });
+    retryConfigPath = join(retryScratch, "checkpoint.config.json");
+    writeFileSync(retryConfigPath, `${JSON.stringify({
+      storePath: join(env.runDir, "capture-store"),
+      // Shared output dir: the retry job gets the NEXT task id (task-002) and
+      // therefore its own image tags, instead of rebuilding job 1's tags.
+      outputDir: join(scratch, "output"),
+      jobsDir: join(retryScratch, "output", "jobs"),
+      captureServiceURL: env.proxy.url,
+      writer: { baseURL: `${repairControlURL}/v1`, model: "mock-writer", apiKeyEnv: "WRITER_API_KEY", maxOutputTokens: 4096 },
+      reviewer: { baseURL: `${repairControlURL}/v1`, model: "mock-reviewer", apiKeyEnv: "REVIEWER_API_KEY", maxOutputTokens: 1024 },
+      judgeModel: "openai/o4-mini",
+      judgeCostEstimateUSDPerCall: 0,
+      solver: { baseURL: `${repairSolverURL}/v1`, model: "unused-captured-id-wins", apiKeyEnv: "SOLVER_API_KEY", providerName: "capture-mock", maxOutputTokens: 1024 },
+      verifierEnv: { OPENAI_API_KEY: "JUDGE_API_KEY", OPENAI_BASE_URL: "JUDGE_BASE_URL" },
+      credentials: {},
+      modelSpendCapUSD: 0.2,
+    }, null, 2)}\n`);
+    // The verifier's judge endpoint is this repair control mock.
+    process.env["JUDGE_BASE_URL"] = `http://host.docker.internal:${new URL(repairControlURL).port}/v1`;
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const fn of cleanups2) {
+      await fn();
+    }
+  });
+
+  it("the repaired second attempt reaches validation and completes without an export collision", async () => {
+    const run = await runCli(["checkpoint", "the agent did not create selected-output.txt"], retryConfigPath);
+    expect(run.status, `queue failed: ${run.stderr}`).toBe(0);
+    const queued = run.stdout.trim().split(" ")[1] ?? "";
+    expect(queued).toMatch(/^task-\d{3}$/);
+
+    const jobsDir = join(retryScratch, "output", "jobs");
+    const jobDirPath = join(jobsDir, readdirSync(jobsDir)[0]!);
+    const job = JSON.parse(readFileSync(join(jobDirPath, "job.json"), "utf8")) as { checkpointId: string; taskId: string };
+    expect(job.taskId).not.toBe("task-001"); // distinct image tags from job 1
+    const done = await waitForStatus(jobDirPath, 900_000);
+    expect(done.state, `runner failed: ${done.detail}`).toBe("SCORED");
+    expect(done.solverReward).toBe(1.0);
+    expect(done.spendUSD).toBe(0);
+    // The repaired task was published under its own id.
+    expect(existsSync(join(scratch, "output", "tasks", job.taskId))).toBe(true);
+
+    // The retry path ran: the smoke rejected attempt 1, the writer repaired
+    // it, and no export collision ever occurred.
+    const log = readFileSync(join(jobDirPath, "log.txt"), "utf8");
+    expect(log).toContain("criteria smoke failed; retrying the writer");
+    // The repaired attempt reached the fixture validation stage and finished.
+    expect(log).toContain("retrying the writer with the previous validation error");
+    expect(log).toContain("step validate: grading known correct and incorrect fixtures");
+    expect(log).toMatch(/^[\s\S]*SCORED task=/);
+    expect(log).not.toContain("target-exists");
+    // The frozen capture was exported exactly once for this job.
+    expect(readdirSync(join(jobDirPath, "export"))).toEqual([`task-${job.checkpointId}`]);
+  }, 1_200_000);
+});
+
+/** Writer returns broken criteria first, repaired criteria on the retry. */
+function repairControlScript(): MockScript {
+  const goodChecks = [
+    "import rewardkit as rk",
+    "rk.file_exists('repair-marker.txt')",
+    "rk.file_contains('repair-marker.txt', 'repair-ok')",
+    "",
+  ].join("\n");
+  const brokenChecks = [
+    "import rewardkit as rk",
+    // An unsupported keyword: RewardKit's built-in factories reject anything
+    // outside weight/name/isolated at registration time.
+    "rk.file_exists('repair-marker.txt', description='bogus-criterion')",
+    "",
+  ].join("\n");
+  return ({ systemText, firstUserText }) => {
+    const prompt = `${systemText}\n${firstUserText}`;
+    if (prompt.includes("You convert a failed coding-agent attempt")) {
+      const repaired = firstUserText.includes("previous_attempt_error");
+      return {
+        content: JSON.stringify({
+          taskName: "replay-repair-marker",
+          taskDescription: "The agent must create repair-marker.txt containing the exact marker string.",
+          instructionMd: "Working in /app, create a file named repair-marker.txt containing the exact marker string agreed in the prior conversation. Do not announce the marker in prose.",
+          checksPy: repaired ? goodChecks : brokenChecks,
+          judgeToml: [
+            "[judge]",
+            'judge = "JUDGE_MODEL_PLACEHOLDER"',
+            'files = ["/app/repair-marker.txt"]',
+            "",
+            "[[criterion]]",
+            'description = "The file contains the exact required marker."',
+            'type = "binary"',
+            "",
+          ].join("\n"),
+          solveSh: "printf 'repair-ok' > repair-marker.txt\n",
+        }),
+      };
+    }
+    if (prompt.includes("independent task-quality reviewer")) {
+      return {
+        content: JSON.stringify({
+          scores: { D1: 90, D2: 90, D3: 80, D4: 80, D5: 80, D6: 90 },
+          overall: 85,
+          notes: "mock review: repaired criteria validated and graded",
+        }),
+      };
+    }
+    if (prompt.includes("You are an evaluation judge")) {
+      return { content: '{"score": 1, "reasoning": "mock judge: criterion satisfied"}' };
+    }
+    return { content: "ok" };
+  };
+}
+
+/** The replayed captured request produces the file-writing tool call once. */
+function repairSolverScript(): MockScript {
+  return ({ lastUserText, toolCallIds }) => {
+    if (lastUserText.includes("FIXTURE_THIRD") && !toolCallIds.includes("call_replay")) {
+      return {
+        toolCalls: [{
+          id: "call_replay",
+          name: "shell",
+          args: { command: "printf 'repair-ok' > repair-marker.txt", description: "create the required marker" },
+        }],
+      };
+    }
+    return { content: "done" };
+  };
+}
 
 function judgePortForControl(): number {
   // The control mock's port is embedded in the writer baseURL of the config.
