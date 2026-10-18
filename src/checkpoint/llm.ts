@@ -85,8 +85,13 @@ export async function chatCompletion(
       throw new LlmError("http", `model endpoint returned ${response.status}: ${text.slice(0, 200)}`);
     }
     const body = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
-      usage?: { cost?: number | null; prompt_tokens?: number; completion_tokens?: number };
+      choices?: Array<{ message?: { content?: string | Array<{ text?: string }>; reasoning?: unknown }; finish_reason?: string }>;
+      usage?: {
+        cost?: number | null;
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        completion_tokens_details?: { reasoning_tokens?: number };
+      };
       model?: string;
     };
     const choice = body.choices?.[0]?.message;
@@ -96,7 +101,19 @@ export async function chatCompletion(
         ? choice.content.map((part) => part.text ?? "").join("")
         : "";
     if (content.trim() === "") {
-      throw new LlmError("invalid", "model returned empty content");
+      // Precise diagnosis, no credentials: why the model produced nothing.
+      const finishReason = body.choices?.[0]?.finish_reason ?? "unknown";
+      const completionTokens = body.usage?.completion_tokens;
+      const reasoningTokens = body.usage?.completion_tokens_details?.reasoning_tokens;
+      const reasoningBlock = typeof choice?.reasoning === "string" && choice.reasoning.trim() !== "";
+      const parts = [
+        `model=${body.model ?? config.model}`,
+        `finish_reason=${finishReason}`,
+        `completion_tokens=${completionTokens ?? "unreported"}`,
+        ...(reasoningTokens !== undefined ? [`reasoning_tokens=${reasoningTokens}`] : []),
+        ...(reasoningBlock && reasoningTokens === undefined ? ["reasoning block present, token split unreported"] : []),
+      ];
+      throw new LlmError("invalid", `model returned empty content (${parts.join(", ")})`);
     }
     const inputTokens = body.usage?.prompt_tokens ?? 0;
     const outputTokens = body.usage?.completion_tokens ?? 0;

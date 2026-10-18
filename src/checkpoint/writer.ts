@@ -27,6 +27,11 @@ export interface WriterInput {
   readonly workspaceFiles: readonly WorkspaceFileExcerpt[];
   readonly attemptExcerpt: string;
   readonly judgeModelPlaceholder: string;
+  /**
+   * Recorded runtime transformations applied to the materialized replay
+   * workspace before the writer sees it (provider scrub, plugin removal).
+   */
+  readonly replayTransformations?: readonly string[];
   /** The previous attempt's validation error, fed back on retry. */
   readonly previousError?: string;
 }
@@ -38,6 +43,8 @@ export interface WriterOutput {
   readonly checksPy: string;
   readonly judgeToml: string | null;
   readonly solveSh: string;
+  /** Mutations of a solved workspace that must earn zero reward. */
+  readonly invalidExamples?: readonly { readonly name: string; readonly script: string }[];
 }
 
 const WRITER_SYSTEM = `You convert a failed coding-agent attempt into a Harbor reinforcement-learning task.
@@ -46,7 +53,7 @@ You receive: the user's original request, the user's description of what went wr
 bounded excerpts of the captured workspace files (path, size, content prefix), an
 excerpt of the prior conversation, and an excerpt of the original failed attempt.
 
-You produce a JSON object with EXACTLY these keys:
+You produce a JSON object with these keys:
 - "taskName": short-kebab-case task name (no spaces).
 - "taskDescription": one-sentence task description.
 - "instructionMd": the task instruction for a fresh agent working in /app. It must
@@ -63,12 +70,29 @@ You produce a JSON object with EXACTLY these keys:
   likert criteria with weights.
 - "solveSh": a bash script that, run with /app as its working directory, turns the
   starting workspace into a CORRECT solution state (idempotent, no network).
+- "invalidExamples": 1 to 4 objects with "name" and "script". Each bash script
+  starts from a COPY OF THE SOLVED workspace and deliberately violates a required
+  outcome. It must exit successfully; the verifier must return reward 0. For exact
+  file content, include an extra trailing newline and wrong content. If other
+  files must not change, include an unrelated-file edit. Never use these examples
+  as special cases in checks: grade the real task constraints.
 
 Rules: the success criteria must check the OUTCOME the user wanted, not the agent's
-prose. The RewardKit API is strict: built-in calls accept ONLY their positional
-arguments plus weight (and isolated for command criteria); @criterion accepts ONLY
-description and shared. NEVER pass name=, description= to a built-in call, or any
-other keyword. Output ONLY the JSON object, no markdown fence.`;
+prose. Required programmatic checks are an all-pass gate: preservation alone
+must not give credit when the requested result is absent. Keep exact byte/content
+requirements exact: do not tolerate trailing newlines, trim whitespace, or weaken
+"no other file changes" to checks on only one file. Do not relax the original
+request in instructionMd. The verifier runs RewardKit in a plain Python container with NO sandbox or
+overlay tooling: command criteria execute directly with /app as their working
+directory. NEVER pass isolated=True to any command criterion (the verifier cannot
+provide filesystem isolation; the criteria smoke rejects the attempt). Built-in
+calls accept ONLY their positional arguments plus weight; @criterion accepts ONLY
+description and shared. NEVER pass name=, description=, or any other keyword to a
+built-in call. workspace_files lists the EXACT files present in /app at task
+start, after the recorded runtime transformations listed in
+replay_transformations. Preservation criteria may only require files that appear
+in workspace_files, and only the content shown there. Output ONLY the JSON
+object, no markdown fence.`;
 
 export function buildWriterMessages(input: WriterInput): ChatMessage[] {
   const payload: Record<string, unknown> = {
@@ -79,6 +103,9 @@ export function buildWriterMessages(input: WriterInput): ChatMessage[] {
     original_attempt_excerpt: input.attemptExcerpt,
     judge_model_placeholder: input.judgeModelPlaceholder,
   };
+  if (input.replayTransformations !== undefined && input.replayTransformations.length > 0) {
+    payload["replay_transformations"] = input.replayTransformations;
+  }
   if (input.previousError !== undefined) {
     payload["previous_attempt_error"] = input.previousError;
     payload["fix_required"] = "Your previous checksPy failed to run with the error above. Fix checksPy so RewardKit accepts it.";
@@ -121,6 +148,12 @@ export function parseWriterOutput(text: string): WriterOutput {
   if (!checksPy.includes("rk.") && !checksPy.includes("@criterion")) {
     throw new LlmError("invalid", "checksPy registers no RewardKit criteria");
   }
+  if (/\bisolated\s*=\s*True\b/.test(checksPy)) {
+    throw new LlmError(
+      "invalid",
+      "checksPy uses isolated=True on a command criterion; the configured verifier cannot provide filesystem isolation (no fuse-overlayfs in the container). Use the default isolated=False so the command runs directly in the graded workspace, or use file criteria.",
+    );
+  }
   const judgeRaw = o["judgeToml"];
   let judgeToml: string | null = null;
   if (judgeRaw !== null && judgeRaw !== undefined) {
@@ -132,7 +165,25 @@ export function parseWriterOutput(text: string): WriterOutput {
     }
     judgeToml = judgeRaw;
   }
+  const invalidRaw = o["invalidExamples"];
+  let invalidExamples: { name: string; script: string }[] = [];
+  if (invalidRaw !== undefined) {
+    if (!Array.isArray(invalidRaw) || invalidRaw.length < 1 || invalidRaw.length > 4) {
+      throw new LlmError("invalid", "invalidExamples must contain 1 to 4 negative validation examples");
+    }
+    invalidExamples = invalidRaw.map((entry: unknown) => {
+      if (entry === null || typeof entry !== "object" ||
+          typeof (entry as Record<string, unknown>)["name"] !== "string" ||
+          typeof (entry as Record<string, unknown>)["script"] !== "string") {
+        throw new LlmError("invalid", "negative examples require a name and script");
+      }
+      const e = entry as { name: string; script: string };
+      if (!e.name.trim() || !e.script.trim()) throw new LlmError("invalid", "negative example fields must not be empty");
+      return e;
+    });
+  }
   return {
+    ...(invalidExamples.length ? { invalidExamples } : {}),
     taskName,
     taskDescription: str("taskDescription"),
     instructionMd: str("instructionMd"),
