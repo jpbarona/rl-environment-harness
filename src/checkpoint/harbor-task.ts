@@ -164,6 +164,9 @@ export function buildHarborTask(options: {
   mkdirSync(solutionDir, { recursive: true });
   writeFileSync(join(solutionDir, "solve.sh"), writer.solveSh);
   chmodSync(join(solutionDir, "solve.sh"), 0o755);
+  for (const [index, example] of (writer.invalidExamples ?? []).entries()) {
+    writeFileSync(join(solutionDir, `invalid-${index}.sh`), example.script);
+  }
 
   // --- tests/: verifier image context. ---
   const testsDir = join(taskDir, "tests");
@@ -171,6 +174,7 @@ export function buildHarborTask(options: {
   writeFileSync(join(testsDir, "test.sh"), verifierTestSh());
   chmodSync(join(testsDir, "test.sh"), 0o755);
   writeFileSync(join(testsDir, "checks.py"), writer.checksPy);
+  writeFileSync(join(testsDir, "finalize_reward.py"), rewardFinalizerSource());
   if (writer.judgeToml !== null) {
     const substituted = writer.judgeToml.replaceAll("JUDGE_MODEL_PLACEHOLDER", config.judgeModel);
     writeFileSync(join(testsDir, "judge.toml"), substituted);
@@ -178,7 +182,7 @@ export function buildHarborTask(options: {
   }
   // RewardKit names a root judge TOML's dimension after its filename stem.
   const components = writer.judgeToml !== null ? "checks = 1.0, judge = 1.0" : "checks = 1.0";
-  writeFileSync(join(testsDir, "reward.toml"), `[[reward]]\nname = "reward"\naggregation = "weighted-mean"\nweights = { ${components} }\n`);
+  writeFileSync(join(testsDir, "reward.toml"), `[scoring.checks]\naggregation = "all-pass"\n\n[[reward]]\nname = "reward"\naggregation = "weighted-mean"\nweights = { ${components} }\n`);
   writeFileSync(join(testsDir, "Dockerfile"), verifierDockerfile());
 
   // --- task.toml (upstream Harbor schema v1.3). ---
@@ -298,7 +302,8 @@ export function verifierTestSh(): string {
 # RewardKit entry point (S5-R6): one numeric solver reward.
 set -eu
 mkdir -p /logs/verifier
-rewardkit /tests --workspace /app --output /logs/verifier/reward.json
+rewardkit /tests --workspace /app --output /logs/verifier/reward-components.json
+python /tests/finalize_reward.py /logs/verifier/reward-components.json /logs/verifier/reward.json /logs/verifier/reward-details.json
 cat /logs/verifier/reward.json
 `;
 }
@@ -335,4 +340,27 @@ build_timeout_sec = 900.0
 function repoRoot(): string {
   // dist/checkpoint/harbor-task.js -> repo root
   return join(fileURLToPath(new URL("../../", import.meta.url)));
+}
+
+/** Preserve rubric partial scores only after every required programmatic check passes. */
+export function rewardFinalizerSource(): string {
+  return `import json, math, pathlib, sys
+
+def main():
+    source, destination, details_path = map(pathlib.Path, sys.argv[1:])
+    scores = json.loads(source.read_text())
+    details = json.loads(details_path.read_text())
+    components = details.get("reward", {}).get("components", [])
+    checks = next((item.get("detail", {}).get("score") for item in components if item.get("name") == "checks"), None)
+    scores["checks"] = checks
+    for key in ("checks", "reward"):
+        value = scores.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("invalid or missing reward component: " + key)
+    reward = scores["reward"] if scores["checks"] == 1 else 0.0
+    destination.write_text(json.dumps({"reward": reward}) + "\\n")
+
+if __name__ == "__main__":
+    main()
+`;
 }

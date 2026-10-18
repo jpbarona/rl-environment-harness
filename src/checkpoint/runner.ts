@@ -235,14 +235,14 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     if (judgeBasis === null) {
       return fail("spend.judge-unaccountable", `the judge model ${config.judgeModel} has no verifiable pricing and no judgeCostEstimateUSDPerCall override; the cap cannot be respected`);
     }
-    const judgeCalls = writer.judgeToml !== null ? 3 : 0; // good fixture + bad fixture + harbor run
+    const judgeCalls = writer.judgeToml !== null ? 3 + (writer.invalidExamples?.length ?? 0) : 0; // good fixture + bad fixture + harbor run
     if (judgeCalls > 0) {
       spend.admit(`${judgeCalls} judge calls`, judgeBasis.perCall * judgeCalls + 0.02);
     }
 
     // --- Known good/bad verifier validation (S5-R6). ---
     step("validate", "grading known correct and incorrect fixtures");
-    const validation = validateFixtures({ built, verifierTag, solverTag, config, jobDir: dir });
+    const validation = validateFixtures({ built, verifierTag, solverTag, config, jobDir: dir, invalidExamples: writer.invalidExamples ?? [] });
     if (!validation.ok) {
       return fail("validate.fixtures", validation.detail);
     }
@@ -296,7 +296,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
       spend.record(judgeBasis.perCall * judgeCalls, `judge calls x${judgeCalls}`, { estimated: !judgeBasis.exact });
     }
     step("review", "independent task-quality review against the universal rubric");
-    const validationSummary = `good-fixture reward ${validation.goodReward}, bad-fixture reward ${validation.badReward} (thresholds: good >= 0.99, bad <= 0.5)`;
+    const validationSummary = `good-fixture reward ${validation.goodReward}, bad-fixture reward ${validation.badReward} (thresholds: good >= 0.99, bad = 0)`;
     const nativeRunSummary = `harbor trial completed with exit 0; solver reward ${solverReward}; ATIF trajectory present`;
     const review: ReviewResult = await runReviewer(
       config.reviewer,
@@ -483,6 +483,7 @@ function validateFixtures(options: {
   readonly solverTag: string;
   readonly config: SystemConfig;
   readonly jobDir: string;
+  readonly invalidExamples: readonly { readonly name: string; readonly script: string }[];
 }): { ok: boolean; goodReward: number; badReward: number; detail: string } {
   const { built, verifierTag, solverTag, config } = options;
   const goodDir = join(options.jobDir, "fixture-good");
@@ -509,7 +510,7 @@ function validateFixtures(options: {
 
   const good = gradeFixture(verifierTag, goodDir, config);
   const bad = gradeFixture(verifierTag, badDir, config);
-  if (good.reward === null || bad.reward === null) {
+  if (good.exit !== 0 || bad.exit !== 0 || good.reward === null || bad.reward === null) {
     return {
       ok: false,
       goodReward: good.reward ?? 0,
@@ -520,8 +521,28 @@ function validateFixtures(options: {
   if (good.reward < 0.99) {
     return { ok: false, goodReward: good.reward, badReward: bad.reward, detail: `the known-correct fixture scored ${good.reward}; expected >= 0.99` };
   }
-  if (bad.reward > 0.5) {
-    return { ok: false, goodReward: good.reward, badReward: bad.reward, detail: `the known-incorrect fixture scored ${bad.reward}; expected <= 0.5` };
+  if (bad.reward !== 0) {
+    return { ok: false, goodReward: good.reward, badReward: bad.reward, detail: `the known-incorrect fixture scored ${bad.reward}; expected 0` };
+  }
+  const negativeResults: { name: string; reward: number | null; exit: number }[] = [];
+  for (const [index, example] of options.invalidExamples.entries()) {
+    const fixtureDir = join(options.jobDir, `fixture-invalid-${index}`);
+    cpSync(goodDir, fixtureDir, { recursive: true });
+    const mutation = runDocker([
+      "run", "--rm", "--platform", "linux/arm64",
+      "-v", `${fixtureDir}:/app`,
+      "-v", `${join(built.taskDir, "solution", `invalid-${index}.sh`)}:/tmp/invalid.sh:ro`,
+      solverTag, "bash", "/tmp/invalid.sh",
+    ], 300_000);
+    if (mutation.status !== 0) {
+      return { ok: false, goodReward: good.reward, badReward: bad.reward, detail: `negative example ${example.name} could not run (exit ${mutation.status})` };
+    }
+    const result = gradeFixture(verifierTag, fixtureDir, config);
+    negativeResults.push({ name: example.name, reward: result.reward, exit: result.exit });
+    writeFileSync(join(options.jobDir, "fixture-validation.json"), JSON.stringify({ good: good.reward, unchanged: bad.reward, negativeResults }, null, 2));
+    if (result.exit !== 0 || result.reward !== 0) {
+      return { ok: false, goodReward: good.reward, badReward: bad.reward, detail: `negative example ${example.name} scored ${result.reward} (exit ${result.exit}); expected reward 0` };
+    }
   }
   return { ok: true, goodReward: good.reward, badReward: bad.reward, detail: "ok" };
 }

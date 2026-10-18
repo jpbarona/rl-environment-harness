@@ -109,7 +109,12 @@ function controlScript(): MockScript {
           checksPy: [
             "import rewardkit as rk",
             "rk.file_exists('selected-output.txt')",
-            "rk.file_contains('selected-output.txt', 'selected-result')",
+            "from pathlib import Path",
+            "@rk.criterion(description='exact result bytes')",
+            "def exact(workspace: Path):",
+            "    p = workspace / 'selected-output.txt'",
+            "    return p.is_file() and p.read_bytes() == b'selected-result'",
+            "rk.file_not_exists('unrelated.txt')",
             "",
           ].join("\n"),
           judgeToml: [
@@ -123,6 +128,11 @@ function controlScript(): MockScript {
             "",
           ].join("\n"),
           solveSh: "printf 'selected-result' > selected-output.txt\n",
+          invalidExamples: [
+            { name: "extra newline", script: "printf '\\n' >> selected-output.txt" },
+            { name: "wrong content", script: "printf wrong > selected-output.txt" },
+            { name: "unrelated edit", script: "printf unrelated > unrelated.txt" },
+          ],
         }),
       };
     }
@@ -237,6 +247,11 @@ describe("S5-R1/R2 checkpoint command, freeze, and background job", () => {
     expect(existsSync(join(taskDir, "images.lock.json"))).toBe(true);
     const status = done;
     expect(status.qualityScore).toBeGreaterThan(0);
+    const validations = JSON.parse(readFileSync(join(jobDirPath, "fixture-validation.json"), "utf8")) as { unchanged: number; negativeResults: Array<{ name: string; reward: number }> };
+    expect(validations.unchanged).toBe(0);
+    expect(validations.negativeResults.map((x) => [x.name, x.reward])).toEqual([
+      ["extra newline", 0], ["wrong content", 0], ["unrelated edit", 0],
+    ]);
     expect(status.solverReward).toBe(1.0);
     expect(status.spendUSD).toBe(0);
     // The review breakdown is retained, not just the overall score.

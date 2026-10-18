@@ -1018,3 +1018,23 @@ Job `job-20261018031213-3482` (deployment `/Users/j.p.barona/Code/Projects/RL-te
 1. Reviewer-identified grading weakness (D5 60): the generated criteria cannot distinguish the requested method from any file placement achieving the outcome. A stricter rubric or method-aware criteria is a future writer-quality improvement, not a pipeline defect.
 2. The Harbor trial directory name is `task__hVCVDSE` in this run versus `task-001` in the deterministic e2e (Harbor-generated trial ids vary); the runner's `findTrialDir` glob handles both.
 3. Live capture-driven re-selection still requires the proxy's in-memory session (by design, S5-R1 identity); the direct job-record path used here applies only when repeating a preserved capture.
+
+
+## Entry 029 — Required-outcome reward gate and task-specific negative validation
+
+**Author:** Codex. **Date:** 2026-10-17, America/New_York (client date). **Branch:** checkpoint-live-fixes. **Status:** implemented and tested; user authorized fixes and pushing the existing PR. [Citation: user instruction “you fix the issues. re push to the PR thats open”.]
+
+### Changes and evidence
+
+- Programmatic criteria use RewardKit `scoring.checks.aggregation = all-pass`. A small verifier output adapter reads the pinned RewardKit nested `reward-details.json` component schema and sets the single final reward to zero unless required checks pass. Valid fractional rubric scores remain available after those checks pass. Raw aggregate output is retained as `reward-components.json`, with the native `reward.json` consumed by Harbor. Support-module execution is guarded so RewardKit discovery can import it safely. [Citation: src/checkpoint/harbor-task.ts rewardFinalizerSource/buildHarborTask/verifierTestSh; tests/checkpoint/grading.test.ts; fixture and trial evidence below.]
+- Writer instructions prohibit weakening exact byte/content constraints and partial preservation coverage. The envelope supports named `invalidExamples` mutation scripts, stored outside the solver image in solution/. Each mutates an isolated copy of the correct fixture; each must grade zero. Unchanged workspace must now grade exactly zero rather than <=0.5. Negative fixture failures prevent publication. Older scripted writer envelopes may omit the optional field; the production prompt asks for 1–4 examples. Judge-call estimates include these additional validations; the accepted cost-estimation approach is otherwise unchanged. [Citation: src/checkpoint/writer.ts; src/checkpoint/runner.ts validateFixtures and judgeCalls; docs/checkpoint.md.]
+- Regression fixture checks exact bytes and exercises extra newline, wrong content and unrelated edit. The real verifier returned correct=1, unchanged=0, and all three negative-example rewards=0. [Citation: work/e2e/checkpoint-fixture-1792294749727-70k0yz/checkpoint-scratch/output/jobs/job-20261018033912-bbv3/fixture-validation.json.]
+
+### Verification
+
+- Final npm run verify: typecheck PASS, 119 unit tests PASS, 5 real OpenCode capture E2E tests PASS. [Citation: command outputs in this implementation session; tests/checkpoint/grading.test.ts and existing suites.]
+- Final npm run test:checkpoint-e2e: 6/6 PASS, 221.10 s, using real Harbor, real OpenCode and separate verifier containers with scripted model endpoints. Includes publication, isolated grading, later-turn freeze and the four-stage writer-repair regression. Both Harbor replays completed successfully. [Citation: work/e2e/checkpoint-fixture-1792294749727-70k0yz/checkpoint-scratch/output/ and checkpoint-retry-scratch/output/; final Vitest output.]
+- Two initial integration runs exposed support-module import and nested component-schema mistakes in this change; both were corrected before the final green run. These failures were not waived. [Citation: earlier test output in this session; corrected rewardFinalizerSource implementation.]
+- The paid live rerun was NOT executed: automatic approval review rejected transmitting the preserved workspace/session capture to OpenRouter without sufficiently explicit payload approval. No key, privacy setting or prior published task was changed. A new successful live generation with these grading fixes remains unverified; deterministic native integration is verified above. [Citation: rejected exec tool call in this session; unchanged trial output/task-002 files.]
+
+Next action: push this change to existing PR #5 for user review/merge. Updating the separate RL-test-run deployment checkout after merge is not part of this source commit. [Citation: https://github.com/jpbarona/rl-environment-harness/pull/5 ; user instruction cited above.]

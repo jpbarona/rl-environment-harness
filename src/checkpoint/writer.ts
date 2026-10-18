@@ -43,6 +43,8 @@ export interface WriterOutput {
   readonly checksPy: string;
   readonly judgeToml: string | null;
   readonly solveSh: string;
+  /** Mutations of a solved workspace that must earn zero reward. */
+  readonly invalidExamples?: readonly { readonly name: string; readonly script: string }[];
 }
 
 const WRITER_SYSTEM = `You convert a failed coding-agent attempt into a Harbor reinforcement-learning task.
@@ -51,7 +53,7 @@ You receive: the user's original request, the user's description of what went wr
 bounded excerpts of the captured workspace files (path, size, content prefix), an
 excerpt of the prior conversation, and an excerpt of the original failed attempt.
 
-You produce a JSON object with EXACTLY these keys:
+You produce a JSON object with these keys:
 - "taskName": short-kebab-case task name (no spaces).
 - "taskDescription": one-sentence task description.
 - "instructionMd": the task instruction for a fresh agent working in /app. It must
@@ -68,9 +70,19 @@ You produce a JSON object with EXACTLY these keys:
   likert criteria with weights.
 - "solveSh": a bash script that, run with /app as its working directory, turns the
   starting workspace into a CORRECT solution state (idempotent, no network).
+- "invalidExamples": 1 to 4 objects with "name" and "script". Each bash script
+  starts from a COPY OF THE SOLVED workspace and deliberately violates a required
+  outcome. It must exit successfully; the verifier must return reward 0. For exact
+  file content, include an extra trailing newline and wrong content. If other
+  files must not change, include an unrelated-file edit. Never use these examples
+  as special cases in checks: grade the real task constraints.
 
 Rules: the success criteria must check the OUTCOME the user wanted, not the agent's
-prose. The verifier runs RewardKit in a plain Python container with NO sandbox or
+prose. Required programmatic checks are an all-pass gate: preservation alone
+must not give credit when the requested result is absent. Keep exact byte/content
+requirements exact: do not tolerate trailing newlines, trim whitespace, or weaken
+"no other file changes" to checks on only one file. Do not relax the original
+request in instructionMd. The verifier runs RewardKit in a plain Python container with NO sandbox or
 overlay tooling: command criteria execute directly with /app as their working
 directory. NEVER pass isolated=True to any command criterion (the verifier cannot
 provide filesystem isolation; the criteria smoke rejects the attempt). Built-in
@@ -153,7 +165,25 @@ export function parseWriterOutput(text: string): WriterOutput {
     }
     judgeToml = judgeRaw;
   }
+  const invalidRaw = o["invalidExamples"];
+  let invalidExamples: { name: string; script: string }[] = [];
+  if (invalidRaw !== undefined) {
+    if (!Array.isArray(invalidRaw) || invalidRaw.length < 1 || invalidRaw.length > 4) {
+      throw new LlmError("invalid", "invalidExamples must contain 1 to 4 negative validation examples");
+    }
+    invalidExamples = invalidRaw.map((entry: unknown) => {
+      if (entry === null || typeof entry !== "object" ||
+          typeof (entry as Record<string, unknown>)["name"] !== "string" ||
+          typeof (entry as Record<string, unknown>)["script"] !== "string") {
+        throw new LlmError("invalid", "negative examples require a name and script");
+      }
+      const e = entry as { name: string; script: string };
+      if (!e.name.trim() || !e.script.trim()) throw new LlmError("invalid", "negative example fields must not be empty");
+      return e;
+    });
+  }
   return {
+    ...(invalidExamples.length ? { invalidExamples } : {}),
     taskName,
     taskDescription: str("taskDescription"),
     instructionMd: str("instructionMd"),
