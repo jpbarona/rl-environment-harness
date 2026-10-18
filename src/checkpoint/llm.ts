@@ -11,13 +11,31 @@ import type { AgentModelConfig } from "./config.js";
 
 export interface LlmCallResult {
   readonly text: string;
-  /** Provider-reported cost in USD; 0 when the provider reports none. */
+  /**
+   * Cost in USD: the provider-reported value when present, otherwise a
+   * documented-ceiling estimate from the token usage (never silently zero).
+   */
   readonly costUSD: number;
+  /** True when costUSD is an estimate rather than a provider-reported value. */
+  readonly costEstimated: boolean;
   readonly model: string;
   readonly usage: {
     readonly inputTokens: number;
     readonly outputTokens: number;
   } | null;
+}
+
+/**
+ * Documented fallback ceiling for cost estimation when the provider does not
+ * report a cost: $3 per million input tokens and $15 per million output
+ * tokens (frontier-tier published prices). Estimates are flagged and count
+ * against the cap; they are never presented as actual spend.
+ */
+export const FALLBACK_INPUT_USD_PER_TOKEN = 3 / 1_000_000;
+export const FALLBACK_OUTPUT_USD_PER_TOKEN = 15 / 1_000_000;
+
+export function estimateCostFromTokens(inputTokens: number, outputTokens: number): number {
+  return inputTokens * FALLBACK_INPUT_USD_PER_TOKEN + outputTokens * FALLBACK_OUTPUT_USD_PER_TOKEN;
 }
 
 export class LlmError extends Error {
@@ -68,7 +86,7 @@ export async function chatCompletion(
     }
     const body = (await response.json()) as {
       choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
-      usage?: { cost?: number; prompt_tokens?: number; completion_tokens?: number };
+      usage?: { cost?: number | null; prompt_tokens?: number; completion_tokens?: number };
       model?: string;
     };
     const choice = body.choices?.[0]?.message;
@@ -80,16 +98,16 @@ export async function chatCompletion(
     if (content.trim() === "") {
       throw new LlmError("invalid", "model returned empty content");
     }
+    const inputTokens = body.usage?.prompt_tokens ?? 0;
+    const outputTokens = body.usage?.completion_tokens ?? 0;
+    const reportedCost = body.usage?.cost;
+    const costEstimated = typeof reportedCost !== "number";
     return {
       text: content,
-      costUSD: typeof body.usage?.cost === "number" ? body.usage.cost : 0,
+      costUSD: costEstimated ? estimateCostFromTokens(inputTokens, outputTokens) : reportedCost!,
+      costEstimated,
       model: body.model ?? config.model,
-      usage: body.usage
-        ? {
-            inputTokens: body.usage.prompt_tokens ?? 0,
-            outputTokens: body.usage.completion_tokens ?? 0,
-          }
-        : null,
+      usage: { inputTokens, outputTokens },
     };
   } catch (err) {
     if (err instanceof LlmError) {
@@ -112,9 +130,15 @@ export async function chatCompletion(
  */
 export class SpendTracker {
   #spentUSD = 0;
+  #estimatedUSD = 0;
   #observations = 0;
 
   constructor(readonly capUSD: number) {}
+
+  /** The portion of the recorded spend that is estimated, not reported. */
+  get estimatedUSD(): number {
+    return this.#estimatedUSD;
+  }
 
   get spentUSD(): number {
     return this.#spentUSD;
@@ -136,8 +160,11 @@ export class SpendTracker {
     }
   }
 
-  record(actualCostUSD: number, label: string): void {
+  record(actualCostUSD: number, label: string, options: { readonly estimated?: boolean } = {}): void {
     this.#spentUSD += actualCostUSD;
+    if (options.estimated === true) {
+      this.#estimatedUSD += actualCostUSD;
+    }
     this.#observations += 1;
     if (this.#spentUSD > this.capUSD) {
       throw new LlmError(

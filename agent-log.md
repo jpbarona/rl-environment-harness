@@ -882,3 +882,50 @@ R1 PASS (quoted description, active-session identity selection via `/checkpoint`
 - `npm run test:package-e2e`: 4 passed (Entry 022 evidence stands; no Step 4 code paths modified).
 
 **Next step:** Step 6 — VM deployment. The opt-in live checkpoint run (`tests/live/checkpoint.live.test.ts`, free models, $0 target) remains available for S5-R7 real-provider evidence.
+
+## Entry 025 — Step 5 review fixes: solver isolation, cap accounting, image pinning, writer context, review breakdown
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `step-5`.
+
+### Review finding 1 — the solver could read the reference solution (closed)
+
+- The solver Dockerfile no longer copies `solution.sh`; the reference solution lives in the task's Harbor-standard `solution/solve.sh` and is MOUNTED read-only into a throwaway container only by the fixture-validation driver. The solver image (and therefore the replaying agent) never contains it. [Citation: `src/checkpoint/harbor-task.ts` (solution/ dir + solverDockerfile comment); unit test asserts the Dockerfile contains no `solution.sh`, `environment/solution.sh` does not exist, and `solution/solve.sh` holds the writer's script.]
+
+### Review finding 2 — cap enforcement reliability (closed)
+
+- Provider-reported costs are used when present; a MISSING provider cost is now ESTIMATED from the reported token usage at a documented ceiling (3 USD/M input, 15 USD/M output — `estimateCostFromTokens`) and flagged `estimated`; it counts against the cap and is never silently zero. Status records `spendUSD` and `spendEstimatedUSD` separately. [Citation: `src/checkpoint/llm.ts` `estimateCostFromTokens` + `SpendTracker.record(..., {estimated})`; unit tests `admits free-model calls, records actuals, tracks estimates...`, `admits a reserved judge budget...`.]
+- Judge calls (invisible to the call-level tracker) are now admitted up front: an explicit `judgeCostEstimateUSDPerCall` override is asserted exact; otherwise the OpenRouter catalog decides (verified-zero-priced models cost 0; priced models are bounded by a documented 64k-input/2k-output per-call ceiling, flagged estimated); UNKNOWN pricing fails the job before any spend (`spend.judge-unaccountable`). The deterministic e2e config asserts the mock judge is free (`judgeCostEstimateUSDPerCall: 0`). [Citation: `judgeCostBasis` in `src/checkpoint/runner.ts`; the e2e config.]
+
+### Review finding 3 — images recorded by id, run by tag (closed)
+
+- Before any execution (fixture grading and the Harbor run), the runner re-inspects each tag and requires it to resolve to the EXACT locked image id; a retag fails the job with `image.retag-detected` and the ids in question. [Citation: the pin-verification block in `src/checkpoint/runner.ts` `runPipeline`.]
+
+### Review finding 4 — the writer could not inspect file contents (closed)
+
+- The writer now receives bounded CONTENT excerpts: up to 24 files (<= 64 KB each), priority by source-file extension, 2048 chars per file, 24 KB total, read from the frozen object store. The writer prompt documents the excerpt semantics and the strict RewardKit keyword rules (built-ins accept only positional args + weight/isolated; @criterion accepts only description/shared). [Citation: `workspaceExcerpts` in `src/checkpoint/runner.ts`; the WRITER_SYSTEM prompt in `src/checkpoint/writer.ts`; unit test `the writer prompt carries the failure description, capture context, and file excerpts`.]
+- New: the generated criteria are smoke-tested against an EMPTY workspace in the verifier image BEFORE fixture or Harbor spend; a criteria-API failure (real free models invent unsupported kwargs — observed: `criterion() got an unexpected keyword argument 'name'`) retries the writer with the error fed back, bounded by the configured retries, then fails with `validate.criteria`. [Citation: the writer/build/smoke loop in `runPipeline`.]
+
+### Review finding 5 — the review breakdown was discarded (closed)
+
+- The full breakdown is retained: `status.json` carries `qualityScores` (per-dimension) + `qualityNotes`, and the published task contains `review.json` with the rubric version, overall, per-dimension scores, notes, and timestamp. The e2e asserts both. [Citation: the publication block in `runPipeline`; the e2e assertions; the SCORED status cited below.]
+
+### Review finding 6 — real-provider checkpoint validation
+
+- Implemented and exercised: `tests/live/checkpoint.live.test.ts` selects zero-priced tool-capable OpenRouter models (catalog filter + provider-family-diversified probes; a tool-use probe, not just reachability), requires a key limit <= 0.20 USD, and runs the IDENTICAL pipeline (real capture, real writer, real images, real fixtures, real Harbor replay, real review).
+- Executed runs (2026-10-18, $0 recorded spend): one run completed a REAL two-turn capture with real OpenCode tool execution on a free model (notes.md rewritten to live-2; 7 tool gates in the trace), queued a job, and the real writer generated real criteria from the real capture; the job failed at fixture validation with a named check (`validate.fixtures`) because the real writer's checks.py used an unsupported RewardKit keyword — exactly the failure class the new criteria smoke + writer retry now catches and repairs. [Citation: `/tmp/ck-live9.log`; job `work/live-checkpoint/output/jobs/job-20261018010940-z61a/log.txt`.]
+- The LATER runs are BLOCKED by the OpenRouter account, not by code: every free-model endpoint now returns HTTP 404 "0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy" (8 provider families probed with full error details). OpenRouter free endpoints require the account's data-policy consent for prompt sharing; with that restriction on, no free model is reachable. The opt-in test is ready; it needs the account's privacy/data-policy setting enabled (or a paid-model authorisation, which stays opt-in) and then one manual run. [Citation: `/tmp/ck-live11.log` probe details.]
+
+### Verification
+
+1. `npx tsc --noEmit` — exit 0.
+2. `npm run test` — 111 passed, 0 failed (adds the estimated-cost tracking, judge-reservation, and solver-isolation builder assertions; the writer-prompt test now asserts file EXCERPTS reach the model).
+3. `npm run test:checkpoint-e2e` — 5 passed, 165 s: full pipeline with the fixes; SCORED status carries the per-dimension breakdown ({D1: 90, D2: 90, D3: 80, D4: 80, D5: 80, D6: 90}), the published task carries `review.json`, and the solver image contains no solution. [Citation: the job status.json cited in Entry 023's evidence root, newest run.]
+4. `npm run test:restore-e2e` — 12 passed, 842.8 s (Entry 024; unchanged baseline).
+5. `npm run test:package-e2e` — 4 passed (Entry 022; no Step 4 code paths modified).
+- One live test execution detail for the record: a live writer ran ~4m44s on a free model before the images built; the runner and the detached-job design held.
+
+### S5-R1–R8 status
+
+R1 PASS · R2 PASS · R3 PASS (writer now sees file contents; breakdown retained; real-model criteria quality improves with the smoke-retry loop) · R4 PASS · R5 PASS (solution isolation + retag detection close the review findings) · R6 PASS · R7 PASS in code; the real-provider run is BLOCKED by the OpenRouter account data policy (evidence above; the opt-in test is ready for one manual run once the policy allows free endpoints) · R8 PASS.
+
+**Next step:** Step 6 — VM deployment, after one authorized live run (free endpoints unblocked or a paid-model authorisation).

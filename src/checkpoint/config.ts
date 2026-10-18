@@ -33,6 +33,13 @@ export interface SystemConfig {
   /** Judge model string used inside RewardKit judge.toml (LiteLLM format). */
   readonly judgeModel: string;
   /**
+   * Optional asserted per-call cost ceiling (USD) for the judge model. When
+   * absent, the runner resolves the judge model's price from the provider
+   * catalog (verified-free models cost zero; priced models use a documented
+   * token ceiling; unknown pricing stops the job before any spend).
+   */
+  readonly judgeCostEstimateUSDPerCall?: number;
+  /**
    * Solver endpoint: the replayed attempt runs against this endpoint with the
    * CAPTURED model id (model/version identity is retained from the capture).
    */
@@ -173,6 +180,10 @@ function validateConfig(parsed: Record<string, unknown>): SystemConfig {
   const writer = requireAgent(parsed, "writer");
   const reviewer = requireAgent(parsed, "reviewer");
   const judgeModel = requireString(parsed, "judgeModel");
+  const judgeCostRaw = parsed["judgeCostEstimateUSDPerCall"];
+  if (judgeCostRaw !== undefined && (typeof judgeCostRaw !== "number" || judgeCostRaw < 0)) {
+    throw new ConfigError("judgeCostEstimateUSDPerCall", "must be a non-negative number");
+  }
   const solverRaw = requireAgent(parsed, "solver");
   const providerNameRaw = (parsed["solver"] as Record<string, unknown>)["providerName"];
   if (typeof providerNameRaw !== "string" || !/^[A-Za-z0-9_-]+$/.test(providerNameRaw)) {
@@ -236,6 +247,7 @@ function validateConfig(parsed: Record<string, unknown>): SystemConfig {
     writer,
     reviewer,
     judgeModel,
+    ...(judgeCostRaw !== undefined ? { judgeCostEstimateUSDPerCall: judgeCostRaw as number } : {}),
     solver,
     verifierEnv,
     credentials,

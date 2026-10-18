@@ -107,18 +107,36 @@ describe("S5 job state and crash sweep", () => {
 });
 
 describe("S5 spend cap", () => {
-  it("admits free-model calls, records actuals, and fails the job when the cap is exceeded", () => {
+  it("admits free-model calls, records actuals, tracks estimates, and fails the job when the cap is exceeded", async () => {
+    const { estimateCostFromTokens } = await import("../../src/checkpoint/llm.js");
     const tracker = new SpendTracker(0.2);
     tracker.admit("writer"); // placeholder 0.02
     tracker.record(0, "writer");
     tracker.admit("reviewer");
     tracker.record(0, "reviewer");
     expect(tracker.spentUSD).toBe(0);
+    expect(tracker.estimatedUSD).toBe(0);
 
-    // A costly call that would exceed the cap is refused before running.
-    tracker.record(0.19, "expensive");
+    // A missing provider cost is estimated from tokens at the documented
+    // ceiling and flagged: it counts against the cap, never silently zero.
+    const estimated = estimateCostFromTokens(10_000, 1_000);
+    expect(estimated).toBeCloseTo(10_000 * (3 / 1_000_000) + 1_000 * (15 / 1_000_000));
+    tracker.record(estimated, "unreported-cost call", { estimated: true });
+    expect(tracker.estimatedUSD).toBeCloseTo(estimated);
+
+    // A costly call that would exceed the cap is refused before running, and
+    // a reported cost that crosses the cap fails the record.
+    expect(() => tracker.record(0.16, "reported")).toThrow(/cap exceeded/);
     expect(() => tracker.admit("next")).toThrow(LlmError);
-    expect(() => tracker.record(0.02, "over")).toThrow(/cap exceeded/);
+  });
+
+  it("admits a reserved judge budget and records its worst case as estimated", () => {
+    const tracker = new SpendTracker(0.2);
+    tracker.admit("3 judge calls", 0.12); // reservation: 3 x 0.04
+    tracker.record(0.12, "judge calls x3", { estimated: true });
+    expect(tracker.spentUSD).toBeCloseTo(0.12);
+    expect(tracker.estimatedUSD).toBeCloseTo(0.12);
+    expect(() => tracker.record(0.09, "over")).toThrow(/cap exceeded/);
   });
 
   it("a missing credential fails the call before any request is sent", async () => {
@@ -161,16 +179,17 @@ describe("S5 writer and reviewer envelopes", () => {
     expect(() => parseWriterOutput(validWriter.replace("null", '"[judge]"'))).toThrow(/JUDGE_MODEL_PLACEHOLDER/);
   });
 
-  it("the writer prompt carries the failure description and capture context", () => {
+  it("the writer prompt carries the failure description, capture context, and file excerpts", () => {
     const messages = buildWriterMessages({
       description: "did not do x", selectedPrompt: "do x", priorContextExcerpt: "user: do x",
-      workspaceFiles: ["a.txt"], attemptExcerpt: "assistant: ok", judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
+      workspaceFiles: [{ path: "a.txt", bytes: 32, excerpt: "counter = 1" }], attemptExcerpt: "assistant: ok", judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
     });
     expect(messages[0]?.role).toBe("system");
     const user = messages[1]?.content ?? "";
     expect(user).toContain("did not do x");
     expect(user).toContain("do x");
     expect(user).toContain("a.txt");
+    expect(user).toContain("counter = 1");
   });
 
   it("parses a valid reviewer output and rejects out-of-range scores", () => {
@@ -236,7 +255,7 @@ describe("S5 deterministic task builder", () => {
 
     const task = built.taskDir;
     // Complete layout.
-    expect(readdirSync(task).sort()).toEqual(["build-report.json", "capture", "environment", "evidence", "instruction.md", "task.toml", "tests"]);
+    expect(readdirSync(task).sort()).toEqual(["build-report.json", "capture", "environment", "evidence", "instruction.md", "solution", "task.toml", "tests"]);
     // Starting workspace baked with the recorded runtime rebinds.
     const report = JSON.parse(readFileSync(join(task, "build-report.json"), "utf8")) as { mutations: string[]; selectedPrompt: string; capturedModel: string };
     expect(report.mutations.some((m) => m.includes("provider/model"))).toBe(true);
@@ -251,11 +270,15 @@ describe("S5 deterministic task builder", () => {
     const selected = JSON.parse(readFileSync(join(task, "environment", "capture", "selected.json"), "utf8")) as Record<string, unknown>;
     expect(selected["sessionId"]).toBe("ses_build");
     expect(selected["prompt"]).toContain("FIXTURE_SECOND");
-    // Solver Dockerfile pins the same runtime as the restore lock.
+    // Solver Dockerfile pins the same runtime as the restore lock and does
+    // NOT bake the reference solution (isolation).
     const solverDockerfile = readFileSync(join(task, "environment", "Dockerfile"), "utf8");
     const lock = JSON.parse(readFileSync(join(repoRoot, "containers", "restore", "lock.json"), "utf8")) as { imageDigest: string; opencode: { sha256: string } };
     expect(solverDockerfile).toContain(lock.imageDigest);
     expect(solverDockerfile).toContain(lock.opencode.sha256);
+    expect(solverDockerfile).not.toContain("solution.sh");
+    expect(existsSync(join(task, "environment", "solution.sh"))).toBe(false);
+    expect(readFileSync(join(task, "solution", "solve.sh"), "utf8")).toContain("selected-output.txt");
     // Verifier: separate image, RewardKit pinned, tests baked.
     expect(readFileSync(join(task, "tests", "Dockerfile"), "utf8")).toContain("harbor-rewardkit==0.2.3");
     const toml = readFileSync(join(task, "task.toml"), "utf8");

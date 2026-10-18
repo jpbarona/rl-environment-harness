@@ -12,13 +12,23 @@
 import { chatCompletion, LlmError, type ChatMessage, type SpendTracker } from "./llm.js";
 import type { AgentModelConfig } from "./config.js";
 
+export interface WorkspaceFileExcerpt {
+  readonly path: string;
+  readonly bytes: number;
+  /** Up to 2048 chars of file content; empty files carry "". */
+  readonly excerpt: string;
+}
+
 export interface WriterInput {
   readonly description: string;
   readonly selectedPrompt: string;
   readonly priorContextExcerpt: string;
-  readonly workspaceFiles: readonly string[];
+  /** Bounded file contents (not just names) so criteria can be precise. */
+  readonly workspaceFiles: readonly WorkspaceFileExcerpt[];
   readonly attemptExcerpt: string;
   readonly judgeModelPlaceholder: string;
+  /** The previous attempt's validation error, fed back on retry. */
+  readonly previousError?: string;
 }
 
 export interface WriterOutput {
@@ -33,8 +43,8 @@ export interface WriterOutput {
 const WRITER_SYSTEM = `You convert a failed coding-agent attempt into a Harbor reinforcement-learning task.
 
 You receive: the user's original request, the user's description of what went wrong,
-the captured workspace file list, an excerpt of the prior conversation, and an excerpt
-of the original failed attempt.
+bounded excerpts of the captured workspace files (path, size, content prefix), an
+excerpt of the prior conversation, and an excerpt of the original failed attempt.
 
 You produce a JSON object with EXACTLY these keys:
 - "taskName": short-kebab-case task name (no spaces).
@@ -55,22 +65,27 @@ You produce a JSON object with EXACTLY these keys:
   starting workspace into a CORRECT solution state (idempotent, no network).
 
 Rules: the success criteria must check the OUTCOME the user wanted, not the agent's
-prose. Output ONLY the JSON object, no markdown fence.`;
+prose. The RewardKit API is strict: built-in calls accept ONLY their positional
+arguments plus weight (and isolated for command criteria); @criterion accepts ONLY
+description and shared. NEVER pass name=, description= to a built-in call, or any
+other keyword. Output ONLY the JSON object, no markdown fence.`;
 
 export function buildWriterMessages(input: WriterInput): ChatMessage[] {
+  const payload: Record<string, unknown> = {
+    user_description_of_failure: input.description,
+    original_user_request: input.selectedPrompt,
+    prior_context_excerpt: input.priorContextExcerpt,
+    workspace_files: input.workspaceFiles,
+    original_attempt_excerpt: input.attemptExcerpt,
+    judge_model_placeholder: input.judgeModelPlaceholder,
+  };
+  if (input.previousError !== undefined) {
+    payload["previous_attempt_error"] = input.previousError;
+    payload["fix_required"] = "Your previous checksPy failed to run with the error above. Fix checksPy so RewardKit accepts it.";
+  }
   return [
     { role: "system", content: WRITER_SYSTEM },
-    {
-      role: "user",
-      content: JSON.stringify({
-        user_description_of_failure: input.description,
-        original_user_request: input.selectedPrompt,
-        prior_context_excerpt: input.priorContextExcerpt,
-        workspace_files: input.workspaceFiles,
-        original_attempt_excerpt: input.attemptExcerpt,
-        judge_model_placeholder: input.judgeModelPlaceholder,
-      }),
-    },
+    { role: "user", content: JSON.stringify(payload) },
   ];
 }
 
@@ -139,7 +154,7 @@ export async function runWriter(
     spend.admit(`writer attempt ${attempt + 1}`);
     try {
       const result = await chatCompletion(config, messages, { timeoutMs: options.timeoutMs });
-      spend.record(result.costUSD, `writer attempt ${attempt + 1}`);
+      spend.record(result.costUSD, `writer attempt ${attempt + 1}`, { estimated: result.costEstimated });
       return parseWriterOutput(result.text);
     } catch (err) {
       lastError = err;

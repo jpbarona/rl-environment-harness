@@ -125,7 +125,13 @@ export function buildHarborTask(options: {
   cpSync(join(repoRoot, "dist"), join(environmentDir, "harness", "dist"), { recursive: true });
 
   writeFileSync(join(environmentDir, "Dockerfile"), solverDockerfile());
-  writeFileSync(join(environmentDir, "solution.sh"), writer.solveSh);
+  // The reference solution lives in the task's Harbor-standard solution/
+  // directory, NOT inside the solver image: the replaying agent must never
+  // be able to read it. Fixture validation mounts it at run time.
+  const solutionDir = join(taskDir, "solution");
+  mkdirSync(solutionDir, { recursive: true });
+  writeFileSync(join(solutionDir, "solve.sh"), writer.solveSh);
+  chmodSync(join(solutionDir, "solve.sh"), 0o755);
 
   // --- tests/: verifier image context. ---
   const testsDir = join(taskDir, "tests");
@@ -231,8 +237,10 @@ RUN node -e "fetch(process.argv[1]).then(r => { if (!r.ok) throw new Error('HTTP
 COPY app /app
 COPY capture /opt/capture
 COPY harness /opt/harness
-COPY solution.sh /opt/solution.sh
-RUN chmod +x /opt/solution.sh
+
+# The reference solution is intentionally NOT baked into this image (isolation:
+# the replaying agent must not read it). It lives in the task's solution/ dir
+# and is mounted only by the validation driver.
 
 ENV OPENCODE_BIN=${lock.opencode.binPath}
 ENV HARNESS_CAPTURE_DIR=/opt/capture

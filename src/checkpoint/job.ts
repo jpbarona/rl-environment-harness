@@ -25,10 +25,15 @@ export interface JobStatus {
   detail: string;
   /** Independent task-quality score (0-100) once reviewed. */
   qualityScore?: number;
+  /** Per-dimension breakdown of the quality review, retained (S5-R3). */
+  qualityScores?: Record<string, number>;
+  qualityNotes?: string;
   /** Solver reward from the Harbor validation run, when available. */
   solverReward?: number;
   /** Aggregate model spend recorded so far, in USD. */
   spendUSD?: number;
+  /** The estimated (non-reported) portion of the recorded spend. */
+  spendEstimatedUSD?: number;
   /** Published task directory, when SCORED. */
   taskDir?: string;
   /** Runner process id, for crash detection. */

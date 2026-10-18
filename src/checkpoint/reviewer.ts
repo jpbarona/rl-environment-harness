@@ -101,7 +101,7 @@ export async function runReviewer(
     spend.admit(`reviewer attempt ${attempt + 1}`);
     try {
       const result = await chatCompletion(config, messages, { timeoutMs: options.timeoutMs });
-      spend.record(result.costUSD, `reviewer attempt ${attempt + 1}`);
+      spend.record(result.costUSD, `reviewer attempt ${attempt + 1}`, { estimated: result.costEstimated });
       return parseReviewerOutput(result.text);
     } catch (err) {
       lastError = err;

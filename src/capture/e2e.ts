@@ -20,6 +20,11 @@ export interface E2EOptions {
   readonly captureDelayMs?: number;
   readonly script?: MockScript;
   /**
+   * Per-run timeout for `opencode run` children. Default 180_000 ms; live
+   * provider runs with slow free models may raise it.
+   */
+  readonly runTimeoutMs?: number;
+  /**
    * Discovery probes: force OpenCode compaction with a tiny model context
    * limit, and force tool-output truncation with huge tool outputs.
    */
@@ -239,7 +244,7 @@ export async function createE2E(options: E2EOptions): Promise<E2EEnv> {
     prompt: string,
     opts?: { readonly continueLast?: boolean },
   ): Promise<RunResult> {
-    return await collect(spawnRun(prompt, opts), 180_000);
+    return await collect(spawnRun(prompt, opts), options.runTimeoutMs ?? 180_000);
   }
 
   function spawnRun(

@@ -55,17 +55,81 @@ async function selectFreeToolModel(): Promise<string> {
     throw new Error(`model catalog unavailable: ${catalog.status}`);
   }
   const { data } = await catalog.json() as { data: CatalogModel[] };
-  const eligible = data
-    .filter((m) => m.id.endsWith(":free") && m.supported_parameters?.includes("tools"))
+  const freeWithTools = data.filter((m) => m.id.endsWith(":free") && m.supported_parameters?.includes("tools"));
+  const eligible = freeWithTools
     .filter((m) => Object.keys(m.pricing).length > 0 && Object.values(m.pricing).every((v) => Number(v) === 0));
   const preferred = process.env["LIVE_MODEL"];
-  const model = preferred
-    ? eligible.find((m) => m.id === preferred)
-    : eligible.find((m) => /qwen.*coder/i.test(m.id)) ?? eligible.find((m) => /nemotron/i.test(m.id)) ?? eligible[0];
-  if (!model) {
-    throw new Error("no eligible zero-cost tool model; paid fallback is forbidden");
+  const candidates = preferred
+    ? eligible.filter((m) => m.id === preferred)
+    : [
+        ...eligible.filter((m) => /code|coder/i.test(m.id)),
+        ...eligible.filter((m) => /qwen/i.test(m.id)),
+        ...eligible.filter((m) => /gemma/i.test(m.id)),
+        ...eligible.filter((m) => /cohere|poolside|thinkingmachines|dots|liquid|xingchen/i.test(m.id)),
+        ...eligible.filter((m) => /nemotron/i.test(m.id)),
+        ...eligible,
+      ];
+  if (candidates.length === 0) {
+    throw new Error(
+      `no eligible zero-cost tool model; paid fallback is forbidden ` +
+      `(catalog: ${data.length} models, free-with-tools: ${freeWithTools.length}, zero-priced: ${eligible.length}, ` +
+      `LIVE_MODEL: ${preferred ?? "unset"}${preferred !== undefined && !eligible.some((m) => m.id === preferred) ? " is not eligible or no longer exists" : ""})`,
+    );
   }
-  return model.id;
+  // Free-model endpoints differ in guardrails and data-policy availability;
+  // probe each candidate with a tiny zero-cost completion and take the first
+  // that responds. No paid fallback exists.
+  const probeKey = process.env["OPENROUTER_API_KEY"]!;
+  // Dedupe by provider family so one blocked family does not consume the
+  // whole probe budget.
+  const seenFamilies = new Set<string>();
+  const probeList: CatalogModel[] = [];
+  for (const candidate of candidates) {
+    const family = candidate.id.split("/")[0] ?? candidate.id;
+    if (seenFamilies.has(family)) {
+      continue;
+    }
+    seenFamilies.add(family);
+    probeList.push(candidate);
+    if (probeList.length >= 8) {
+      break;
+    }
+  }
+  const probeFailures: string[] = [];
+  for (const candidate of probeList) {
+    try {
+      // The probe tests TOOL USE, not just reachability: the capture and the
+      // replay both need a model that emits tool calls.
+      const probe = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: `Bearer ${probeKey}` },
+        body: JSON.stringify({
+          model: candidate.id,
+          messages: [{ role: "user", content: "Use the record_note tool to record the note 'ok'." }],
+          max_tokens: 128,
+          tools: [{
+            type: "function",
+            function: {
+              name: "record_note",
+              description: "Record a short note.",
+              parameters: { type: "object", properties: { note: { type: "string" } }, required: ["note"] },
+            },
+          }],
+        }),
+        signal: AbortSignal.timeout(45_000),
+      });
+      if (probe.ok) {
+        const body = await probe.json() as { choices?: Array<{ message?: { tool_calls?: Array<unknown> } }> };
+        if ((body.choices?.[0]?.message?.tool_calls ?? []).length > 0) {
+          return candidate.id;
+        }
+      }
+      probeFailures.push(`${candidate.id}: HTTP ${probe.status} ${(await probe.text()).slice(0, 120)}`);
+    } catch (err) {
+      probeFailures.push(`${candidate.id}: ${String(err instanceof Error ? err.message : err).slice(0, 120)}`);
+    }
+  }
+  throw new Error(`every probed free-model endpoint failed guardrails or did not respond; details: ${probeFailures.join(" | ")}`);
 }
 
 beforeAll(async () => {
@@ -89,24 +153,13 @@ describe("opt-in live checkpoint workflow (real provider, $0 target)", () => {
     const openrouter = "https://openrouter.ai/api/v1";
     const judgeEnv: Record<string, string> = { OPENROUTER_API_KEY: "OPENROUTER_API_KEY" };
 
-    // Real capture: two turns with the selected free model.
-    const firstPrompt = "LIVE_FIRST replace the notes version";
-    const secondPrompt = "LIVE_SECOND create result.txt containing live-ok";
-    const emitted = new Set<string>();
+    // Real capture: two turns with the selected free model. Single-tool-call
+    // prompts: weak free models must be able to complete them.
+    const firstPrompt = "Use the shell tool to append the line live-2 to the end of notes.md. Then reply with the single word done.";
+    const secondPrompt = "Use the shell tool to create a file named result.txt whose entire content is exactly live-ok. Then reply with the single word done.";
     env = await createE2E({ name: "live-checkpoint", captureDelayMs: 600,
+      runTimeoutMs: 900_000,
       live: { upstreamURL: openrouter, model: modelId, apiKey: process.env["OPENROUTER_API_KEY"] ?? "" },
-      script: ({ model, lastUserText }) => {
-        if (model !== modelId && !model.endsWith(modelId.split("/").pop() ?? "")) return undefined;
-        if (emitted.has(lastUserText)) return { content: "done" };
-        let command: string;
-        if (lastUserText.includes(firstPrompt)) {
-          command = "printf 'live-2\\n' > notes.md";
-        } else if (lastUserText.includes(secondPrompt)) {
-          command = "printf 'live-ok' > result.txt";
-        } else return { content: "done" };
-        emitted.add(lastUserText);
-        return { toolCalls: [{ id: `call_${emitted.size}`, name: "shell", args: { command, description: "live fixture step" } }] };
-      },
     });
     cleanups.push(env.cleanup);
     const r1 = await env.runPrompt(firstPrompt);

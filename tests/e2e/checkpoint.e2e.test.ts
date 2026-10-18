@@ -81,6 +81,8 @@ beforeAll(async () => {
     writer: { baseURL: `${controlURL}/v1`, model: "mock-writer", apiKeyEnv: "WRITER_API_KEY", maxOutputTokens: 4096 },
     reviewer: { baseURL: `${controlURL}/v1`, model: "mock-reviewer", apiKeyEnv: "REVIEWER_API_KEY", maxOutputTokens: 1024 },
     judgeModel: "openai/o4-mini",
+    // The judge endpoint here is the loopback mock: asserted free per call.
+    judgeCostEstimateUSDPerCall: 0,
     solver: { baseURL: `${solverURL}/v1`, model: "unused-captured-id-wins", apiKeyEnv: "SOLVER_API_KEY", providerName: "capture-mock", maxOutputTokens: 1024 },
     verifierEnv: { OPENAI_API_KEY: "JUDGE_API_KEY", OPENAI_BASE_URL: "JUDGE_BASE_URL" },
     credentials: {},
@@ -237,6 +239,13 @@ describe("S5-R1/R2 checkpoint command, freeze, and background job", () => {
     expect(status.qualityScore).toBeGreaterThan(0);
     expect(status.solverReward).toBe(1.0);
     expect(status.spendUSD).toBe(0);
+    // The review breakdown is retained, not just the overall score.
+    expect(Object.keys(status.qualityScores ?? {}).length).toBeGreaterThanOrEqual(6);
+    // The published task retains the full review as grading provenance.
+    const review = JSON.parse(readFileSync(join(taskDir, "review.json"), "utf8")) as { overall: number; scores: Record<string, number>; rubricVersion: string };
+    expect(review.overall).toBe(status.qualityScore);
+    expect(Object.keys(review.scores)).toHaveLength(6);
+    expect(review.rubricVersion).toContain("universal-task-quality");
 
     // Published artifacts are the real graded outputs.
     const lock = JSON.parse(readFileSync(join(taskDir, "images.lock.json"), "utf8")) as { solver: { imageId: string }; verifier: { imageId: string } };
@@ -297,6 +306,7 @@ interface StatusLike {
   state: string;
   detail: string;
   qualityScore?: number;
+  qualityScores?: Record<string, number>;
   solverReward?: number;
   spendUSD?: number;
 }

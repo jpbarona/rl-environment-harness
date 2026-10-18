@@ -86,7 +86,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     const messages = primary.body.messages ?? [];
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     const selectedPrompt = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
-    const manifest = JSON.parse(readFileSync(join(recordsDir, "manifest.json"), "utf8")) as { files: Array<{ path: string }> };
+    const manifest = JSON.parse(readFileSync(join(recordsDir, "manifest.json"), "utf8")) as { files: Array<{ path: string; kind: string; sha256?: string; size?: number }> };
     const priorContext = JSON.parse(readFileSync(join(recordsDir, "prior_context.json"), "utf8")) as { priorMessages: Array<{ role: string; content: unknown }> };
     const priorExcerpt = priorContext.priorMessages
       .slice(-6)
@@ -96,40 +96,69 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
       .slice(-3)
       .map((m) => `${m.role}: ${typeof m.content === "string" ? m.content.slice(0, 400) : "[structured content]"}`)
       .join("\n");
-    const writer: WriterOutput = await runWriter(
-      config.writer,
-      {
-        description: record.description,
-        selectedPrompt: selectedPrompt.slice(0, 4000),
-        priorContextExcerpt: priorExcerpt.slice(0, 4000),
-        workspaceFiles: manifest.files.map((f) => f.path).slice(0, 200),
-        attemptExcerpt: attemptExcerpt.slice(0, 2000),
-        judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
-      },
-      spend,
-      { timeoutMs: config.timeouts.writerMs, retries: config.retries.writer },
-    );
-
-    // --- Build (S5-R4). ---
-    step("build", "assembling the Harbor task from the frozen capture");
-    const built = buildHarborTask({ config, jobDir: dir, checkpointId: record.checkpointId, writer, repoRoot: repoRoot() });
-    update({ detail: `task assembled; ${built.mutations.length} recorded runtime rebinds` });
-
-    // --- Image builds (S5-R5): immutable local identities. ---
-    step("build", "building solver and verifier images");
+    const writerInput = {
+      description: record.description,
+      selectedPrompt: selectedPrompt.slice(0, 4000),
+      priorContextExcerpt: priorExcerpt.slice(0, 4000),
+      workspaceFiles: workspaceExcerpts(config.storePath, manifest),
+      attemptExcerpt: attemptExcerpt.slice(0, 2000),
+      judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
+    };
     const solverTag = `rl-task-${record.taskId}-solver`;
     const verifierTag = `rl-task-${record.taskId}-verifier`;
-    for (const [tag, context] of [
-      [solverTag, join(built.taskDir, "environment")],
-      [verifierTag, join(built.taskDir, "tests")],
-    ] as const) {
-      const build = runDocker(["build", "--platform", "linux/arm64", "-t", tag, context], 900_000);
-      if (build.status !== 0) {
-        return fail("build.image", `${tag}: docker build failed: ${build.stderr.slice(-400)}`);
+
+    // Writer + build + criteria smoke, with the validation error fed back to
+    // the writer on retry (bounded). Real models invent unsupported API calls;
+    // the smoke catches them before any fixture or Harbor spend.
+    let writer: WriterOutput | undefined;
+    let built: ReturnType<typeof buildHarborTask> | undefined;
+    let verifierId = "";
+    let previousError: string | undefined;
+    const writerAttempts = 1 + config.retries.writer;
+    for (let attempt = 1; attempt <= writerAttempts; attempt += 1) {
+      step("writer", attempt === 1 ? "generating task definition from the frozen capture" : `retrying the writer with the previous validation error`);
+      writer = await runWriter(
+        config.writer,
+        { ...writerInput, ...(previousError !== undefined ? { previousError } : {}) },
+        spend,
+        { timeoutMs: config.timeouts.writerMs, retries: 0 },
+      );
+      step("build", "assembling the Harbor task from the frozen capture");
+      built = buildHarborTask({ config, jobDir: dir, checkpointId: record.checkpointId, writer, repoRoot: repoRoot() });
+      update({ detail: `task assembled; ${built.mutations.length} recorded runtime rebinds` });
+      step("build", "building the verifier image");
+      const verifierBuild = runDocker(["build", "--platform", "linux/arm64", "-t", verifierTag, join(built.taskDir, "tests")], 900_000);
+      if (verifierBuild.status !== 0) {
+        return fail("build.image", `${verifierTag}: docker build failed: ${verifierBuild.stderr.slice(-400)}`);
       }
+      verifierId = runDocker(["image", "inspect", "--format", "{{.Id}}", verifierTag], 30_000).stdout.trim();
+      step("validate", "criteria smoke test (empty workspace)");
+      const smoke = runDocker([
+        "run", "--rm", "--platform", "linux/arm64",
+        "-v", `${join(built.taskDir, "tests")}:/tests:ro`,
+        verifierTag,
+        "bash", "-c", "mkdir -p /tmp/ws /tmp/out && rewardkit /tests --workspace /tmp/ws --output /tmp/out/reward.json >/dev/null 2>/tmp/smoke-err.txt; cat /tmp/smoke-err.txt >&2; test -s /tmp/out/reward.json",
+      ], 300_000);
+      if (smoke.status === 0) {
+        break;
+      }
+      previousError = (smoke.stderr || smoke.stdout).slice(-800);
+      if (attempt === writerAttempts) {
+        return fail("validate.criteria", `the generated criteria never ran cleanly: ${previousError.slice(0, 300)}`);
+      }
+      log(`criteria smoke failed; retrying the writer: ${previousError.slice(0, 200)}`);
+    }
+    if (writer === undefined || built === undefined) {
+      return fail("writer.internal", "the writer loop produced no output");
+    }
+
+    // --- Image builds (S5-R5): immutable local identities. ---
+    step("build", "building the solver image");
+    const solverBuild = runDocker(["build", "--platform", "linux/arm64", "-t", solverTag, join(built.taskDir, "environment")], 900_000);
+    if (solverBuild.status !== 0) {
+      return fail("build.image", `${solverTag}: docker build failed: ${solverBuild.stderr.slice(-400)}`);
     }
     const solverId = runDocker(["image", "inspect", "--format", "{{.Id}}", solverTag], 30_000).stdout.trim();
-    const verifierId = runDocker(["image", "inspect", "--format", "{{.Id}}", verifierTag], 30_000).stdout.trim();
     if (solverId === "" || verifierId === "") {
       return fail("build.image", "built images could not be inspected for immutable ids");
     }
@@ -149,9 +178,34 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
         .replace("# SOLVER_DOCKER_IMAGE_PLACEHOLDER", `docker_image = "${solverTag}"`),
     );
 
+    // Pin verification (S5-R5): the tags in task.toml must still resolve to
+    // the exact locked ids at execution time; a retag fails the job.
+    for (const [label, tag, lockedId] of [
+      ["solver", solverTag, solverId],
+      ["verifier", verifierTag, verifierId],
+    ] as const) {
+      const currentId = runDocker(["image", "inspect", "--format", "{{.Id}}", tag], 30_000).stdout.trim();
+      if (currentId !== lockedId) {
+        return fail("image.retag-detected", `${label} image ${tag} now resolves to ${currentId || "nothing"}; the locked id was ${lockedId}`);
+      }
+    }
+
+    // Judge-call cap admission (S5-R7): the judge runs inside RewardKit and
+    // is invisible to the call-level tracker, so its bounded cost is admitted
+    // up front from an explicit estimate, a provider price lookup, or a
+    // verified zero price. Unaccountable judge pricing fails before any spend.
+    const judgeBasis = await judgeCostBasis(config);
+    if (judgeBasis === null) {
+      return fail("spend.judge-unaccountable", `the judge model ${config.judgeModel} has no verifiable pricing and no judgeCostEstimateUSDPerCall override; the cap cannot be respected`);
+    }
+    const judgeCalls = writer.judgeToml !== null ? 3 : 0; // good fixture + bad fixture + harbor run
+    if (judgeCalls > 0) {
+      spend.admit(`${judgeCalls} judge calls`, judgeBasis.perCall * judgeCalls + 0.02);
+    }
+
     // --- Known good/bad verifier validation (S5-R6). ---
     step("validate", "grading known correct and incorrect fixtures");
-    const validation = validateFixtures({ built, verifierTag, solverTag, config });
+    const validation = validateFixtures({ built, verifierTag, solverTag, config, jobDir: dir });
     if (!validation.ok) {
       return fail("validate.fixtures", validation.detail);
     }
@@ -197,7 +251,13 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     }
     update({ solverReward, detail: `native harbor run ok; solver reward ${solverReward}` });
 
-    // --- Independent review (S5-R3). ---
+    // Judge-call accounting: the verifier runs made judgeCalls judge
+    // invocations (good fixture, bad fixture, native run). A verified-free
+    // judge records exact zero; an asserted or catalog-priced judge records
+    // its bounded worst case and is flagged as estimated.
+    if (judgeCalls > 0) {
+      spend.record(judgeBasis.perCall * judgeCalls, `judge calls x${judgeCalls}`, { estimated: !judgeBasis.exact });
+    }
     step("review", "independent task-quality review against the universal rubric");
     const validationSummary = `good-fixture reward ${validation.goodReward}, bad-fixture reward ${validation.badReward} (thresholds: good >= 0.99, bad <= 0.5)`;
     const nativeRunSummary = `harbor trial completed with exit 0; solver reward ${solverReward}; ATIF trajectory present`;
@@ -223,6 +283,15 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
     if (credentialHits.length > 0) {
       return fail("publish.credentials", credentialHits.slice(0, 3).join("; "));
     }
+    // The full review breakdown is retained: in the task (grading provenance)
+    // and in the job status (S5-R3).
+    writeFileSync(join(built.taskDir, "review.json"), `${JSON.stringify({
+      rubricVersion: config.rubric.version,
+      overall: review.overall,
+      scores: review.scores,
+      notes: review.notes,
+      reviewedAt: new Date().toISOString(),
+    }, null, 2)}\n`);
     const tasksDir = join(config.outputDir, "tasks");
     mkdirSync(tasksDir, { recursive: true });
     const target = join(tasksDir, record.taskId);
@@ -235,10 +304,13 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
       step: "done",
       detail: `published; quality ${review.overall}/100 (${config.rubric.version})`,
       qualityScore: review.overall,
+      qualityScores: review.scores,
+      qualityNotes: review.notes,
       spendUSD: spend.spentUSD,
+      spendEstimatedUSD: spend.estimatedUSD,
       taskDir: target,
     });
-    log(`SCORED task=${record.taskId} quality=${review.overall} solverReward=${solverReward} spend=${spend.spentUSD.toFixed(4)}`);
+    log(`SCORED task=${record.taskId} quality=${review.overall} breakdown=${JSON.stringify(review.scores)} solverReward=${solverReward} spend=${spend.spentUSD.toFixed(4)} (estimated ${spend.estimatedUSD.toFixed(4)})`);
   } catch (err) {
     if (err instanceof LlmError && err.kind === "budget") {
       fail("spend.cap-exceeded", err.message);
@@ -248,7 +320,83 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
   }
 }
 
-/** Solver provider config passed to the agent; model id comes from the capture. */
+/** Bounded file-content excerpts for the writer (S5-R3 gap fix). */
+const EXCERPT_PRIORITY = [".md", ".py", ".ts", ".js", ".json", ".toml", ".yaml", ".yml", ".sh", ".txt"];
+
+function workspaceExcerpts(storeRoot: string, manifest: { files: Array<{ path: string; kind: string; sha256?: string; size?: number }> }): Array<{ path: string; bytes: number; excerpt: string }> {
+  const MAX_FILES = 24;
+  const MAX_TOTAL_CHARS = 24_000;
+  const PER_FILE_CHARS = 2048;
+  const files = manifest.files
+    .filter((f) => f.kind === "file" && typeof f.sha256 === "string")
+    .filter((f) => (f.size ?? Number.MAX_SAFE_INTEGER) <= 64_000);
+  const priority = (path: string): number => {
+    const lower = path.toLowerCase();
+    const ext = lower.slice(lower.lastIndexOf("."));
+    const index = EXCERPT_PRIORITY.indexOf(ext);
+    return index >= 0 ? index : EXCERPT_PRIORITY.length;
+  };
+  files.sort((a, b) => priority(a.path) - priority(b.path) || a.path.localeCompare(b.path));
+  const out: Array<{ path: string; bytes: number; excerpt: string }> = [];
+  let total = 0;
+  for (const file of files) {
+    if (out.length >= MAX_FILES || total >= MAX_TOTAL_CHARS) {
+      break;
+    }
+    try {
+      const content = readFileSync(join(storeRoot, "objects", file.sha256!), "utf8");
+      const excerpt = content.slice(0, PER_FILE_CHARS);
+      total += excerpt.length;
+      out.push({ path: file.path, bytes: content.length, excerpt });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+/**
+ * Per-call cost basis for one judge invocation. An explicit config override
+ * is asserted exact; otherwise the provider catalog decides: verified
+ * zero-priced models are exact zero, priced models are bounded by a
+ * documented token ceiling per call (estimated), and unknown pricing returns
+ * null (the cap cannot be respected).
+ */
+async function judgeCostBasis(config: SystemConfig): Promise<{ perCall: number; exact: boolean } | null> {
+  if (typeof config.judgeCostEstimateUSDPerCall === "number" && config.judgeCostEstimateUSDPerCall >= 0) {
+    return { perCall: config.judgeCostEstimateUSDPerCall, exact: true };
+  }
+  if (!config.judgeModel.startsWith("openrouter/")) {
+    return null;
+  }
+  const modelId = config.judgeModel.slice("openrouter/".length);
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(20_000) });
+    if (!response.ok) {
+      return null;
+    }
+    const { data } = (await response.json()) as { data: Array<{ id: string; pricing: Record<string, string> }> };
+    const model = data.find((m) => m.id === modelId);
+    if (model === undefined) {
+      return null;
+    }
+    const prices = Object.values(model.pricing).map((v) => Number(v));
+    if (prices.length === 0) {
+      return null;
+    }
+    if (prices.every((p) => p === 0)) {
+      return { perCall: 0, exact: true };
+    }
+    const inputPrice = Number(model.pricing["prompt"] ?? "0");
+    const outputPrice = Number(model.pricing["completion"] ?? "0");
+    // Documented ceiling for one judge interaction: 64k prompt tokens (the
+    // rubric plus graded files) and 2k completion tokens.
+    return { perCall: 64_000 * inputPrice + 2_000 * outputPrice, exact: false };
+  } catch {
+    return null;
+  }
+}
+
 function solverOpencodeConfig(config: SystemConfig, capturedModelId: string): string {
   return JSON.stringify({
     provider: {
@@ -297,23 +445,26 @@ function validateFixtures(options: {
   readonly verifierTag: string;
   readonly solverTag: string;
   readonly config: SystemConfig;
+  readonly jobDir: string;
 }): { ok: boolean; goodReward: number; badReward: number; detail: string } {
   const { built, verifierTag, solverTag, config } = options;
-  const jobDirPath = join(built.taskDir, "..");
-  const goodDir = join(jobDirPath, "fixture-good");
-  const badDir = join(jobDirPath, "fixture-bad");
+  const goodDir = join(options.jobDir, "fixture-good");
+  const badDir = join(options.jobDir, "fixture-bad");
   rmSync(goodDir, { recursive: true, force: true });
   rmSync(badDir, { recursive: true, force: true });
   cpSync(join(built.taskDir, "environment", "app"), goodDir, { recursive: true });
   cpSync(join(built.taskDir, "environment", "app"), badDir, { recursive: true });
 
-  // Known-correct fixture: apply the writer's solution inside the solver image.
+  // Known-correct fixture: apply the writer's solution inside the solver
+  // image. The solution is MOUNTED at run time, never baked into the image
+  // (isolation: the replaying agent must not read the reference solution).
   const solve = runDocker([
     "run", "--rm", "--platform", "linux/arm64",
     "-v", `${goodDir}:/app`,
+    "-v", `${join(built.taskDir, "solution", "solve.sh")}:/tmp/solve.sh:ro`,
     "-e", "HOME=/tmp",
     solverTag,
-    "bash", "/opt/solution.sh",
+    "bash", "/tmp/solve.sh",
   ], 300_000);
   if (solve.status !== 0) {
     return { ok: false, goodReward: 0, badReward: 0, detail: `solution script failed (exit ${solve.status}): ${(solve.stderr || solve.stdout).slice(-300)}` };
