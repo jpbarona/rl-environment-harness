@@ -4,7 +4,7 @@
 
 Create reproducible reinforcement learning (RL) task candidates from model attempts on normal software tasks. OpenCode is the interactive agent. The harness captures state, restores it, packages it, and checks that the agent can run. OpenRouter provides model access.
 
-**Current position:** Steps 1-4 are complete with passing evidence. Step 5 is next: connect !checkpoint and run a bounded live attempt. The agreed boundary is: Step 3 restores and compares; Step 4 packages for portability; Step 5 connects the user command and live attempt.
+**Current position:** Steps 1-4 are complete with passing evidence. Step 5 is next: background checkpoint creation with smart task writing, native Harbor execution, RewardKit grading, and independent task-quality review. The agreed boundary is: Step 3 restores and compares; Step 4 packages for portability; Step 5 connects the user command, task generation, grading and quality review.
 
 The first application is a quality audit of Xiaomi's public MiMo-V2.6 RL task dataset. Capturing that software work can produce additional task candidates. [Dataset](https://huggingface.co/datasets/XiaomiMiMo/MiMo-V2.6-RL-oss)
 
@@ -16,19 +16,19 @@ This document is editable. Use short, precise technical English. Detailed eviden
 
 ```mermaid
 flowchart TD
-    A[You send a request in OpenCode] --> B[Save starting files and prior context]
-    B --> C[Record effective model input before forwarding]
-    C --> D[Model and tools attempt the task]
-    D --> E[You select an attempt with !checkpoint]
-    E --> F[Save portable task candidate]
-    F --> G[Restore and check it]
-    G --> H[Short live-model attempt]
-    H --> I[Script prints status and task ID]
+    A[Normal OpenCode request] --> B[Automatic starting-state and context capture]
+    B --> C[Solver attempts the task]
+    C --> D[checkpoint with quoted failure description]
+    D --> E[Freeze last attempt; queue background job]
+    E --> F[Smart writer creates task and verifier]
+    F --> G[Native Harbor and verifier validation]
+    G --> H[Independent task-quality score]
+    H --> I[Atomic publication and checkpoint scores]
 ```
 
-Capture is automatic. A user turn is one request and its resulting attempt. A checkpoint identifies the starting state before that request. The original response and later tool actions are retained as evidence, outside the restored starting context.
+In OpenCode, use `!checkpoint "The agent did not do x"`. The shell command accepts a string, prints the queued task ID and returns. No interactive review is required. Keep the current last-attempt selection and active-session identity rules. Later work cannot change the frozen task. Background jobs continue after OpenCode closes.
 
-`!checkpoint` defaults to the most recent eligible request in the active session. An explicit selector can choose an earlier request. The checkpoint command itself is not a task request. No global newest-session selection is permitted.
+The starting workspace and prior context define the retry. The original attempt's response and tools are evidence, outside active replay context. Use `checkpoint scores` to see task-quality scores, FAILED or RUNNING.
 
 ## Storage and isolation
 
@@ -55,7 +55,7 @@ flowchart LR
     A[1 Scaffold: complete] --> B[2 Capture: complete]
     B --> C[3 Restore files and context: complete]
     C --> D[4 Portable task package: complete]
-    D --> E[5 !checkpoint and live attempt]
+    D --> E[5 Background checkpoint and Harbor grading]
     E --> F[6 VM deployment]
 ```
 
@@ -65,7 +65,7 @@ flowchart LR
 | 2 — Capture | Identified starting checkpoints | Frozen R1–R6 pass; real OpenCode capture and the optional live case have evidence. |
 | 3 — Restore | Restore command and comparison reports | Two fresh containers reproduce the full workspace and effective input; negative fixtures fail. |
 | 4 — Package | Portable task folder in the agreed layout | The folder contains all required data and restores without the original store. |
-| 5 — User command | Working !checkpoint with deterministic confirmation | One command selects, packages, restores, checks, and makes a bounded real-model/tool attempt. |
+| 5 — User command | Background Harbor task generation and grading | One command freezes the last attempt, creates and validates a task/verifier, and publishes an independent quality score. |
 | 6 — Deploy | Verified VM installation | The same workflow passes from a clean checkout on the selected VM. |
 
 ### Step 3 — Restore files and context
@@ -88,15 +88,15 @@ Use Step 3's restore command to check the exported folder from a separate locati
 
 **Requirements:** [Step 4](docs/step-4-requirements.md).
 
-### Step 5 — Connect !checkpoint and prove it runs
+### Step 5 — Background checkpoint, task writing and grading
 
-Connect the active-session selection, Step 4 exporter, and Step 3 restore checks. Run a short low-cost model attempt through OpenRouter. Require a valid response and a real tool execution. Record a model substitution as a test override.
+Reuse capture, export and restore. A smart writer uses the selected capture and failure description to create task instructions and success criteria. Support script checks, a model rubric, or both through RewardKit. A separate agent scores task quality against the agreed universal rubric after the writer finishes.
 
-The script prints a fixed status and task ID. It keeps the saved package if checks or inference fail. A runtime smoke test must never claim that the task's reward is correct.
+Run native Harbor before marking the task READY. Validate known good/bad results. A separate verifier container receives the finished workspace and trajectory, runs grading and emits one numeric solver reward. A grading error is not a solver reward of zero.
 
-**Output:** the first complete user workflow.
+The task-quality rubric covers instructions, starting state/context, intent alignment, result/behaviour coverage, known good/bad grading and native execution. Its score is separate from solver reward. No human approval gate or minimum score threshold was agreed.
 
-**Requirements:** [Step 5](docs/step-5-requirements.md).
+**Requirements and exact interface references:** [Step 5](docs/step-5-requirements.md).
 
 ### Step 6 — Deploy
 
@@ -104,19 +104,36 @@ Document clean installation. Select a VM with the user. Keep provisioning separa
 
 **Output:** installation instructions and remote acceptance evidence. Freeze the provider-specific requirements before this step begins. Scripted batches follow deployment; start with 10–20 trials before increasing concurrency.
 
-## Package layout
+## Step 5 storage and environments
 
 ```text
-<task-id>/
-  instruction.md
-  task.toml
-  environment/Dockerfile
-  capture/                 # custom extension: checkpoint, objects, adapter/runtime locks
-  evidence/                # original attempt; excluded from active agent context
-  tests/test.sh            # explicit runtime check or validated task verifier
+output/
+  tasks/<task-id>/
+    instruction.md
+    task.toml
+    environment/Dockerfile
+    tests/                 # Dedicated verifier Dockerfile, checks and rubric
+    capture/
+    evidence/
+    images.lock.json
+  jobs/<job-id>/            # Progress, quality score, logs and diagnostics
 ```
 
-This is a Harbor-shaped candidate with our capture extension. Harbor defines instruction, configuration, environment, and verifier components. Our adapter handles OpenCode restoration. A generic runtime check is not a task-success reward. Native Harbor evaluation compatibility must not be claimed from folder names alone. [Harbor task format](https://docs.harborframework.com/tasks/overview)
+Images reside in Docker's image store; packages lock their identities. Registry digests are used when publishing images. Configuration specifies workspace/output directories, writer/reviewer/judge models, credential variable names, limits and the quality rubric. The harness runs beside OpenCode on a VM or another supported host.
+
+```mermaid
+flowchart LR
+    A[Solver image: restored workspace and OpenCode] --> B[Finished files and trajectory]
+    B --> C[Harbor declared artifact transfer]
+    C --> D[Verifier image: checks and RewardKit]
+    D --> E[Judge API if used]
+    D --> F[One solver reward]
+    E --> F
+```
+
+Keep rubric, reference answers and judge credentials outside the solver. Test access restrictions. The verifier starts its own application instance if required; live process state is not transferred. Restore saved conversation context, not just the task instruction.
+
+Step 4 proved portable capture export. Step 5 adds native Harbor compatibility; folder names alone do not establish it. Use the [Harbor task format](https://docs.harborframework.com/tasks/overview), [separate verifier and artifact transfer](https://docs.harborframework.com/tasks/separate-verifier), and [RewardKit judge interface](https://docs.harborframework.com/rewardkit/judge-criteria). Detailed file and API references are in the Step 5 requirements.
 
 ## Rules for implementation and review
 
@@ -130,6 +147,6 @@ This is a Harbor-shaped candidate with our capture extension. Harbor defines ins
 8. Missing prerequisites are BLOCKED, not PASS. Preserve evidence; append verified results and citations to agent-log.md.
 9. End with a short status, evidence location, and next step. A passing test count alone does not establish completion.
 
-## Live-test budget
+## Model-spend budgets
 
-The user-approved spending cap is $0.10. The optional live-capture test accepts this key limit. Free-model selection remains enforced.
+Step 5 has a $0.20 aggregate model-spend cap per checkpoint: generation, independent review, validation judge calls and retries. Later solver runs and grading use a separate runtime budget. VM/container compute is separate. The existing optional live-capture test retains its separate $0.10 key-limit contract; this edit does not change test code.

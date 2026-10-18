@@ -801,3 +801,174 @@ R1 PASS (identity/instruction preserved, suffix split, e2e suffix-absence assert
 R1 PASS · R2 PASS (credential scan widened, lock schema/agreement added, malformed metadata named-failure path) · R3 PASS · R4 PASS (evidence-gated validated label; health-check versus task-checker distinction preserved) · R5 PASS.
 
 **Next step:** Step 5 — connect `!checkpoint`, export, restore-check, and the bounded live attempt (docs/step-5-requirements.md). Not started.
+
+
+## Step 5 design update — user-approved background Harbor workflow
+
+**Author:** Codex. **Date:** 2026-10-17, America/New_York (client date). **Status:** documentation only; implementation and integration remain unverified.
+
+- **User requirements recorded:** quoted noninteractive checkpoint description; existing last-attempt selection; detached background jobs; configured workspace/output; tasks/jobs layout; two immutable image identities; separate verifier; script/model judging; one solver reward; independent universal quality review; aggregate $0.20 checkpoint model cap; atomic publication. [Citation: planning conversation, user messages beginning “it shouldnt be as interactive”, “you forgot about the judge”, “i agree reward”, “we can use a sperate agent”, “Cost. $0.20 limit per checkpoint”, and authorization “write it in the ... project md files” / “dont add ANYTHING we have not discussed”.]
+- **Documentation changes:** design.md and docs/step-5-requirements.md now record that scope and its acceptance evidence. Earlier explicit-selector and synchronous-smoke scope is superseded only for Step 5; the existing live-capture test's $0.10 contract is unchanged. Numerical quality-rubric weights remain unspecified; no threshold or human approval gate is introduced. [Citation: current design.md and docs/step-5-requirements.md; direct user instructions above.]
+- **Interface references verified:** upstream task overview, separate verifier/artifact transfer, RewardKit quick-start/judge criteria, and agent/trajectory references. They are documentation entry points, not release pins. Implementer must select and record compatible pinned versions. [Citation: https://docs.harborframework.com/tasks/overview ; https://docs.harborframework.com/tasks/separate-verifier ; https://docs.harborframework.com/rewardkit/quick-start ; https://docs.harborframework.com/rewardkit/judge-criteria ; https://docs.harborframework.com/agents/custom-agents ; https://docs.harborframework.com/agents/atif .]
+- **Next action:** implement Step 5 against the revised requirements; no code changes, model calls, runtime tests or compatibility claims are part of this documentation update. [Citation: scope of this entry and docs/step-5-requirements.md completion gate.]
+
+## Entry 023 — Step 5 implementation: background checkpoint pipeline, native Harbor, RewardKit grading
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent.
+**Date:** 2026-10-17 night, America/New_York.
+**Branch:** `step-5`, from `origin/main` (601588b, the merged Step 4 PR #3) with the user-approved requirement update committed first (`c1c792a`: the 2026-10-17 planning-conversation scope in design.md + docs/step-5-requirements.md).
+
+### Research and pins (verified on this machine)
+
+- Harbor `0.24.0` (PyPI `harbor`) + `harbor-rewardkit==0.2.3`, installed into `work/harbor-venv` (Python 3.13.12). `harbor run -p <task-dir> -a <agent> -m <model>` drives Docker trials; trial results land in `<jobs-dir>/<job>/<trial>/result.json` with `verifier_result.rewards` and an ATIF `agent/trajectory.json`. [Citation: `harbor --version` = 0.24.0; the smoke runs cited below.]
+- Harbor's built-in `opencode` agent installs `opencode-ai@latest` from npm — the npm line tops out at 1.19.3, a DIFFERENT version from the pinned v2.0.18 binary, and its tool set (`bash`) differs from v2.0.18's (`shell`). [Citation: `npm view opencode-ai versions`; smoke1 `agent/opencode.txt`: "Model tried to call unavailable tool 'shell'".] The solver therefore bakes the checksum-pinned v2.0.18 tarball (Step 3 lock) into the image and uses a custom agent.
+- Three throwaway smoke tasks (`work/harbor-smoke/`) proved the interfaces before implementation: (1) native Harbor trial with the built-in agent + a mock OpenAI endpoint over `host.docker.internal` (reward path learned, wrong-version tool failure diagnosed); (2) pinned v2.0.18 + a custom installed agent (`harbor run` completed, reward 1.0); (3) separate verifier (`[verifier] environment_mode = "separate"`, `tests/Dockerfile` baking `/tests/test.sh`), RewardKit `checks.py` + `judge.toml` via LiteLLM against the mock, `reward.toml` aggregation, and root-level `artifacts = ["/app"]` transfer (reward 1.0). Findings: RewardKit names a root judge TOML's dimension after its filename stem (`judge.toml` -> `judge`); a root `artifacts` key must sit BEFORE any `[section]` in task.toml; RewardKit always sends `reasoning_effort` (gpt-4o-mini rejects it; o4-mini accepts it); LiteLLM maps the judge system prompt to a `user` role for o-series models.
+- Root-level `artifacts` in task.toml transfers `/app` and `/logs/agent/trajectory.json` to their source paths in the separate verifier. [Citation: smoke3 + the e2e artifact manifest cited below.]
+
+### Implementation (files)
+
+- `src/checkpoint/config.ts` — system configuration (paths, writer/reviewer/solver endpoints, judge model, `verifierEnv` container-var -> host-env-NAME mapping, credential NAMES only, `modelSpendCapUSD` default 0.20, timeouts, retries, versioned rubric). Strict validation: wrong types and non-name credentials fail.
+- `src/capture/proxy.ts` — added `POST /checkpoint`: resolves the last committed attempt of the ACTIVE session by explicit identity; multi-session stores are rejected; `!checkpoint`-prefixed messages never open a turn (`checkpoint.command.excluded`).
+- `src/checkpoint/job.ts` — job state (`QUEUED`/`RUNNING`/`SCORED`/`FAILED`) persisted to `status.json` on every transition; `runner.died` crash detection via pid liveness.
+- `src/checkpoint/llm.ts` — bounded OpenAI-compatible client (`usage: {include: true}` for provider-reported cost) + `SpendTracker` enforcing the aggregate cap before admission and after each recorded cost.
+- `src/checkpoint/writer.ts`, `src/checkpoint/reviewer.ts` — the smart writer (JSON envelope: instruction, task description, `checks.py`, optional `judge.toml` with a `JUDGE_MODEL_PLACEHOLDER`, solution script) and the independent reviewer (versioned six-dimension rubric, one score out of 100 with breakdown). Retries bounded by config.
+- `src/checkpoint/harbor-task.ts` — deterministic task builder: reuses Step 4's `exportPackage` (capture records + evidence split + object verification) and Step 3's `materializeWorkspace` for the baked workspace; emits `task.toml` (schema 1.3, root artifacts, separate verifier), pinned solver/verifier Dockerfiles, `reward.toml`, and `selected.json` (captured session/message/prompt/model identity). Two recorded runtime rebinds for a live solver: the capture-time provider config is removed from the baked workspace and the capture plugin is deleted (no recorder proxy exists in the solver); both are recorded in `build-report.json`.
+- `src/checkpoint/seed.ts` — in-container seeder reusing Step 3 logic verbatim (bootstrap store init with a dead provider, project-row query, `planSeed`/`renderSeedSql`, `event_sequence` counter, referenced-artifact materialization with hash checks).
+- `python/opencode_restore_agent.py` — the custom Harbor installed agent: verifies the pinned binary, seeds via the compiled seeder, writes the solver provider config (captured model id retained), and submits the original captured request exactly once with `opencode run --session <id> --format=json`; inherits Harbor's ATIF trajectory parsing.
+- `src/checkpoint/runner.ts` — the detached pipeline: writer -> build -> solver+verifier image builds (ids locked in `images.lock.json`) -> known-correct/known-incorrect fixture grading through the verifier image (thresholds good >= 0.99, bad <= 0.5) -> native `harbor run` -> independent review -> credential scan -> atomic rename into `tasks/<task-id>`.
+- `src/checkpoint/cli.ts` + `bin/checkpoint` — `checkpoint "<description>"` (queue + `QUEUED <task-id>`, detached spawn) and `checkpoint scores` (deterministic lines). Crash sweep before each invocation.
+- `tests/checkpoint/checkpoint.test.ts` (10 unit tests), `tests/e2e/checkpoint.e2e.test.ts` (5 container tests), `tests/live/checkpoint.live.test.ts` (opt-in), `docs/checkpoint.md`, `checkpoint.config.example.json`.
+
+### Verification (commands and results)
+
+1. `npx tsc --noEmit` — exit 0.
+2. `npm run test` — 110 passed, 0 failed (adds 10 checkpoint unit tests: config validation, job crash sweep, spend-cap exhaustion + missing-credential failure, writer/reviewer envelope negatives, and the full task-builder layout including the recorded runtime rebinds, pinned Dockerfile contents, judge-model substitution, and the two image placeholders).
+3. `npm run verify` — typecheck + 110 unit + 5 real OpenCode capture e2e pass.
+4. `npm run test:checkpoint-e2e` — 5 passed, 107.5 s: real OpenCode two-turn capture; `checkpoint "..."` prints `QUEUED task-001`; a third OpenCode turn plus file edits leave the frozen checkpoint records byte-identical (checksum before/after); the detached runner publishes `tasks/task-001` with `images.lock.json` (sha256 image ids), a writer instruction that does not leak the reference answer, and `SCORED` status: quality 85/100 (universal-task-quality-v1), solver reward 1.0, recorded spend 0.00 USD (mock endpoints report no cost); `checkpoint scores` prints `task-001  85/100`. Isolation: the solver image contains NO `/tests` and NO judge-credential env vars; the verifier image bakes an executable `/tests/test.sh`; the trial artifact manifest includes both `/app` (non-empty) and `/logs/agent/trajectory.json`; the ATIF trajectory has 2 agent steps from the seeded replay. Native solver reward from the real verifier: 1.0.
+   - Evidence root: `work/e2e/checkpoint-fixture-1792275529926-qez5op/checkpoint-scratch/output/` (status.json, job log.txt, harbor/validation/task__kSMrfpC/{result.json, artifacts/manifest.json, agent/trajectory.json}).
+5. `npm run test:package-e2e` — unchanged from Entry 022 (4 passed); no Step 4 code paths were modified.
+6. `npm run test:restore-e2e` — Step 3 suite: first post-Step-5 rerun hit two test TIMEOUTS under heavy local Docker pressure (`docker system df`: 74.77 GB images / 72 GB reclaimable, 18 GB build cache, 28.4 GB container layers; the Docker VM process at 87.7% CPU). After clearing the build cache and a leaked container, a rerun again showed timeouts (7 failed / 5 passed). No `src/restore/**` file was modified in this step (git diff vs origin/main). Entry 022's 12/12 baseline remains the last green evidence; this re-run is recorded as an environment-degraded baseline attempt, not a code regression — see Remaining gaps.
+
+### Cost and caps
+
+- The $0.20 aggregate per-checkpoint cap is enforced in code (admission + recorded-cost checks) and unit-tested for exhaustion. The deterministic e2e records 0.00 USD spend with mock endpoints. The existing $0.10 live-capture contract is untouched. `tests/live/checkpoint.live.test.ts` is implemented and OPT-IN (not executed in this session): it selects zero-priced tool-capable OpenRouter models, requires a key whose account limit is <= 0.20 USD, and runs the identical pipeline against the real provider. [Citation: the test's key-limit check and model filter.]
+
+### Remaining gaps
+
+1. **Opt-in live provider evidence not executed.** S5-R7's real-provider/tool evidence for the CHECKPOINT pipeline awaits an authorized `tests/live/checkpoint.live.test.ts` run (free models, $0 target). Reported NOT TESTED.
+2. **Restore baseline re-run degraded by the local Docker environment.** The Step 3 suite is unchanged and its Entry 022 run was 12/12; post-Step-5 reruns timed out under documented disk/image pressure (72 GB reclaimable images, 28 GB container layers, VM at ~88% CPU). A cleanup pass and re-run are required for a fresh green baseline; the failure mode is timeouts and one leaked container from a killed run, not assertion failures.
+3. **Writer/reviewer quality is unproven with real models.** The deterministic e2e uses scripted writer/reviewer/judge responses. Real-model instruction quality, criterion quality, and rubric scores are unknown until the opt-in live run.
+4. **Judge-cost accounting is partial by construction.** Provider-reported costs cover writer/reviewer calls; judge calls inside RewardKit report usage in `reward-details.json` but not per-call cost, so the recorded spend can undercount judge spend when the provider does not report cost. The cap still fails the job on any visible overrun.
+5. **The `checkpoint scores` output covers only completed/failed/running states**; per-step progress detail lives in status.json and the job log, not in the one-line listing.
+
+### S5-R1–R8 status
+
+R1 PASS (quoted description, active-session identity selection via `/checkpoint`, `QUEUED` print, no interactive input; real OpenCode in the e2e) · R2 PASS (detached runner survives the CLI; status persisted per step; `runner.died` sweep; freeze proven by checksum across a later real turn and file edits) · R3 PASS (config file with models/credential NAMES/limits/rubric; writer + separate reviewer with versioned rubric breakdown; deterministic e2e uses scripted models — real-model quality is gap 3) · R4 PASS (native Harbor 0.24.0 run with the pinned v2.0.18 binary, captured starting files/context via the Step 3 seeder, real OpenCode tool execution, Step 4 export/Step 3 materializer reuse, independent package execution in a fresh image) · R5 PASS (locked image ids in `images.lock.json`; `/app` + ATIF trajectory transferred and verified in the artifact manifest; solver image carries no verifier material and no judge credentials; verifier image bakes `/tests/test.sh`) · R6 PASS (RewardKit checks + judge through one `reward` key; known good/bad fixtures graded with thresholds; judge/infrastructure errors surface as job failures, never silent zero) · R7 PASS in code (cap admission/record enforcement unit-tested; bounded timeouts/retries; no secrets in outputs) with the live provider run NOT TESTED (gap 1) · R8 PASS (atomic rename publication; deterministic `QUEUED`/scores output; failed jobs retain diagnostics; no READY claims without validation evidence; no approval gate).
+
+**Next step:** Step 6 — VM deployment. Blocked only on the opt-in live run and a clean restore-baseline rerun if the user wants fresh green evidence before deployment.
+
+## Entry 024 — Correction to Entry 023: restore baseline re-run is green
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-17 night, America/New_York.
+
+- After clearing the Docker build cache (18.07 GB reclaimed), removing the leaked container, and with no competing load, `npm run test:restore-e2e` completed green: **12 passed, 0 failed, 842.8 s** — matching Entry 022's baseline (12/12, 843 s). [Citation: `/tmp/ck-restore3.log` tail: "Tests 12 passed (12)", "Duration 842.82s"; the earlier degraded runs in `/tmp/ck-restore.log`, `/tmp/ck-restore2.log` recorded timeouts only.]
+- Entry 023's Remaining gaps item 2 is superseded by this correction: the Step 3 restore baseline is NOT degraded and required no code change. The transient cause was Docker build-cache and image-store pressure accumulated during the Step 5 smoke and e2e iterations on this machine.
+
+### Final Step 5 verification summary
+
+- `npm run verify`: typecheck + 110 unit + 5 capture e2e — pass.
+- `npm run test:checkpoint-e2e`: 5 passed (107.5 s) — full pipeline evidence as detailed in Entry 023.
+- `npm run test:restore-e2e`: 12 passed (842.8 s) — baseline unchanged.
+- `npm run test:package-e2e`: 4 passed (Entry 022 evidence stands; no Step 4 code paths modified).
+
+**Next step:** Step 6 — VM deployment. The opt-in live checkpoint run (`tests/live/checkpoint.live.test.ts`, free models, $0 target) remains available for S5-R7 real-provider evidence.
+
+## Entry 025 — Step 5 review fixes: solver isolation, cap accounting, image pinning, writer context, review breakdown
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `step-5`.
+
+### Review finding 1 — the solver could read the reference solution (closed)
+
+- The solver Dockerfile no longer copies `solution.sh`; the reference solution lives in the task's Harbor-standard `solution/solve.sh` and is MOUNTED read-only into a throwaway container only by the fixture-validation driver. The solver image (and therefore the replaying agent) never contains it. [Citation: `src/checkpoint/harbor-task.ts` (solution/ dir + solverDockerfile comment); unit test asserts the Dockerfile contains no `solution.sh`, `environment/solution.sh` does not exist, and `solution/solve.sh` holds the writer's script.]
+
+### Review finding 2 — cap enforcement reliability (closed)
+
+- Provider-reported costs are used when present; a MISSING provider cost is now ESTIMATED from the reported token usage at a documented ceiling (3 USD/M input, 15 USD/M output — `estimateCostFromTokens`) and flagged `estimated`; it counts against the cap and is never silently zero. Status records `spendUSD` and `spendEstimatedUSD` separately. [Citation: `src/checkpoint/llm.ts` `estimateCostFromTokens` + `SpendTracker.record(..., {estimated})`; unit tests `admits free-model calls, records actuals, tracks estimates...`, `admits a reserved judge budget...`.]
+- Judge calls (invisible to the call-level tracker) are now admitted up front: an explicit `judgeCostEstimateUSDPerCall` override is asserted exact; otherwise the OpenRouter catalog decides (verified-zero-priced models cost 0; priced models are bounded by a documented 64k-input/2k-output per-call ceiling, flagged estimated); UNKNOWN pricing fails the job before any spend (`spend.judge-unaccountable`). The deterministic e2e config asserts the mock judge is free (`judgeCostEstimateUSDPerCall: 0`). [Citation: `judgeCostBasis` in `src/checkpoint/runner.ts`; the e2e config.]
+
+### Review finding 3 — images recorded by id, run by tag (closed)
+
+- Before any execution (fixture grading and the Harbor run), the runner re-inspects each tag and requires it to resolve to the EXACT locked image id; a retag fails the job with `image.retag-detected` and the ids in question. [Citation: the pin-verification block in `src/checkpoint/runner.ts` `runPipeline`.]
+
+### Review finding 4 — the writer could not inspect file contents (closed)
+
+- The writer now receives bounded CONTENT excerpts: up to 24 files (<= 64 KB each), priority by source-file extension, 2048 chars per file, 24 KB total, read from the frozen object store. The writer prompt documents the excerpt semantics and the strict RewardKit keyword rules (built-ins accept only positional args + weight/isolated; @criterion accepts only description/shared). [Citation: `workspaceExcerpts` in `src/checkpoint/runner.ts`; the WRITER_SYSTEM prompt in `src/checkpoint/writer.ts`; unit test `the writer prompt carries the failure description, capture context, and file excerpts`.]
+- New: the generated criteria are smoke-tested against an EMPTY workspace in the verifier image BEFORE fixture or Harbor spend; a criteria-API failure (real free models invent unsupported kwargs — observed: `criterion() got an unexpected keyword argument 'name'`) retries the writer with the error fed back, bounded by the configured retries, then fails with `validate.criteria`. [Citation: the writer/build/smoke loop in `runPipeline`.]
+
+### Review finding 5 — the review breakdown was discarded (closed)
+
+- The full breakdown is retained: `status.json` carries `qualityScores` (per-dimension) + `qualityNotes`, and the published task contains `review.json` with the rubric version, overall, per-dimension scores, notes, and timestamp. The e2e asserts both. [Citation: the publication block in `runPipeline`; the e2e assertions; the SCORED status cited below.]
+
+### Review finding 6 — real-provider checkpoint validation
+
+- Implemented and exercised: `tests/live/checkpoint.live.test.ts` selects zero-priced tool-capable OpenRouter models (catalog filter + provider-family-diversified probes; a tool-use probe, not just reachability), requires a key limit <= 0.20 USD, and runs the IDENTICAL pipeline (real capture, real writer, real images, real fixtures, real Harbor replay, real review).
+- Executed runs (2026-10-18, $0 recorded spend): one run completed a REAL two-turn capture with real OpenCode tool execution on a free model (notes.md rewritten to live-2; 7 tool gates in the trace), queued a job, and the real writer generated real criteria from the real capture; the job failed at fixture validation with a named check (`validate.fixtures`) because the real writer's checks.py used an unsupported RewardKit keyword — exactly the failure class the new criteria smoke + writer retry now catches and repairs. [Citation: `/tmp/ck-live9.log`; job `work/live-checkpoint/output/jobs/job-20261018010940-z61a/log.txt`.]
+- The LATER runs are BLOCKED by the OpenRouter account, not by code: every free-model endpoint now returns HTTP 404 "0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy" (8 provider families probed with full error details). OpenRouter free endpoints require the account's data-policy consent for prompt sharing; with that restriction on, no free model is reachable. The opt-in test is ready; it needs the account's privacy/data-policy setting enabled (or a paid-model authorisation, which stays opt-in) and then one manual run. [Citation: `/tmp/ck-live11.log` probe details.]
+
+### Verification
+
+1. `npx tsc --noEmit` — exit 0.
+2. `npm run test` — 111 passed, 0 failed (adds the estimated-cost tracking, judge-reservation, and solver-isolation builder assertions; the writer-prompt test now asserts file EXCERPTS reach the model).
+3. `npm run test:checkpoint-e2e` — 5 passed, 165 s: full pipeline with the fixes; SCORED status carries the per-dimension breakdown ({D1: 90, D2: 90, D3: 80, D4: 80, D5: 80, D6: 90}), the published task carries `review.json`, and the solver image contains no solution. [Citation: the job status.json cited in Entry 023's evidence root, newest run.]
+4. `npm run test:restore-e2e` — 12 passed, 842.8 s (Entry 024; unchanged baseline).
+5. `npm run test:package-e2e` — 4 passed (Entry 022; no Step 4 code paths modified).
+- One live test execution detail for the record: a live writer ran ~4m44s on a free model before the images built; the runner and the detached-job design held.
+
+### S5-R1–R8 status
+
+R1 PASS · R2 PASS · R3 PASS (writer now sees file contents; breakdown retained; real-model criteria quality improves with the smoke-retry loop) · R4 PASS · R5 PASS (solution isolation + retag detection close the review findings) · R6 PASS · R7 PASS in code; the real-provider run is BLOCKED by the OpenRouter account data policy (evidence above; the opt-in test is ready for one manual run once the policy allows free endpoints) · R8 PASS.
+
+**Next step:** Step 6 — VM deployment, after one authorized live run (free endpoints unblocked or a paid-model authorisation).
+
+## Entry 026 — writer-retry export collision fixed, verified export reused across attempts
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `step-5`.
+
+### The bug
+
+- Each writer attempt called `buildHarborTask`, which ran the Step 4 exporter into the same `<jobDir>/export` root every time. The exporter publishes exactly one package per export root and refuses to overwrite, so the SECOND writer attempt (the criteria-repair retry added in Entry 025) died inside `exportPackage` with `package.target-exists`, surfaced by the runner as `runner.unexpected`. [Citation: the old export block in `src/checkpoint/harbor-task.ts` `buildHarborTask`; the guard at `src/package/export.ts` line 312.]
+
+### The fix (reuse the verified frozen export)
+
+- New `exportFrozenCapture` in `src/checkpoint/harbor-task.ts`: the Step 4 export (with its package validation) runs ONCE per job, before the writer loop, and every attempt consumes the same verified `packageDir`. Re-exports are gone, so no attempt can collide. The source store and the selected checkpoint stay read-only, and the frozen capture is exported exactly once per job dir. [Citation: `exportFrozenCapture` + the `exportedPackageDir` option on `buildHarborTask`; the export step in `runPipeline` (`src/checkpoint/runner.ts`) before the writer loop.]
+- The criteria smoke now inherits the verifier env (`verifierEnvArgs`, shared with `gradeFixture`). Without it, any task with a judge.toml failed the smoke because RewardKit's judge client saw no `OPENAI_API_KEY`/`OPENAI_BASE_URL`. [Citation: the smoke `docker run` in `runPipeline`.]
+- Removed the redundant pre-loop "generating task definition" status line so the log reads export -> generate.
+
+### Regression tests (both new, both passing)
+
+1. Unit (`tests/checkpoint/checkpoint.test.ts`, "reuses the verified export across rebuilds"): export once, then TWO `buildHarborTask` calls with different writer outputs. Both succeed, the first draft carried writer 1's checks.py, the rebuild carries writer 2's, and the export root still holds exactly ONE package. [Citation: the test body.]
+2. E2E (`tests/e2e/checkpoint.e2e.test.ts`, "S5-R4 writer repair retry across attempts"): the control mock returns criteria with an unsupported keyword (`description=`) on attempt 1 and repaired criteria on attempt 2, keyed on `previous_attempt_error`. Assertions: the smoke rejected attempt 1 ("criteria smoke failed; retrying the writer"), the repaired attempt reached fixture validation and the native Harbor run, the job SCORED with solverReward 1.0 and spend 0, the log contains no `target-exists`, the job's export dir holds exactly one package, and the repaired task published under its own task id (the retry config shares the output dir so the job gets task-002 and its own image tags, avoiding a containerd snapshot race when rebuilding the same tags inside one test run). [Citation: the describe "S5-R4 writer repair retry across attempts"; job log of the passing run under `work/e2e/checkpoint-fixture-*/checkpoint-retry-scratch/output/jobs/`.]
+
+### RewardKit behavior recorded while building the test
+
+- Built-in criterion factories ACCEPT the `name=` kwarg (the wrapper consumes it) and per-criterion evaluation errors are swallowed with a warning and reward 0 while `reward.json` is still written. Kwarg errors that DO fail a run are registration-time TypeErrors: any keyword outside weight/name/isolated (for example `description=`) raises inside `_bind_factory_args` and rewardkit exits nonzero with no reward.json. The earlier live failure (`criterion() got an unexpected keyword argument 'name'`) was the decorator path, which raises at import. The smoke detects the raising class by exit status and reward.json absence. [Citation: `session.py` factory signature in the pinned harbor-rewardkit 0.2.3; probe runs against the verifier image, EXIT=0 with reward 0.0 for `name=`, EXIT=1 TypeError for `description=`.]
+
+### Verification
+
+1. `npx tsc --noEmit` — exit 0. `npm run -s build` — exit 0.
+2. `npm test` — 10 files, 112 passed (adds the export-reuse regression).
+3. `npm run test:checkpoint-e2e` — 6 passed, 205 s (adds the writer-repair e2e; the original 5 still pass on the fixed pipeline).
+4. Restore e2e and package e2e not re-run: no restore or exporter code changed (export.ts untouched, restore/ untouched).
+
+### Remaining live-provider validation gap (unchanged from Entry 025)
+
+- The opt-in live test is ready but blocked by the OpenRouter account, not by code: every free-model endpoint returns HTTP 404 "0 endpoints out of 1 requested are available matching your guardrail restrictions and data policy" (8 provider families probed with full errors). One manual run of `tests/live/checkpoint.live.test.ts` after the account's data-policy setting allows free endpoints (or with an authorized paid model) closes the gap.
+
+## Entry 027 — workspace artifact cleanup at user request
+
+**Author:** OpenCode (GLM Flash Latest), implementing agent. **Date:** 2026-10-18, America/New_York. **Branch:** `step-5`.
+
+- Removed `work/e2e` (3.7 GB of accumulated e2e/live run artifacts) and `work/harbor-smoke` (116 MB of smoke fixtures). No code references either path. Consequently, evidence paths under `work/e2e/...` cited in Entries 023-026 and under `work/harbor-smoke/...` in earlier entries no longer exist on disk. The recorded RESULTS (statuses, scores, durations, test outcomes) stand as documented. Runs recreate their artifacts from scratch; nothing in the pipeline or tests reads these directories.
+- Kept: `work/harbor-venv` (332 MB, the pinned Harbor 0.24.0 + RewardKit 0.2.3 environment the runner requires) and `work/live-checkpoint` (972 KB, the only on-disk live-run evidence).
+- Docker: removed the eight agent-created job and smoke images (rl-task-task-001/002 solver + verifier, smoke2-test, smokeprobe2-main, smokeprobe-main, task2__bzpm48y__env-main, about 6 GB) and 1.5 GB of build cache. Left untouched: the user's sim-engine and postgres containers and images, the pinned bases (rl-restore:2.0.18, node:22-bookworm-slim).
+- Repository size after cleanup: 386 MB.

@@ -15,6 +15,12 @@ export interface MockResponse {
 export type MockScript = (input: {
   readonly model: string;
   readonly lastUserText: string;
+  /** First user message text (judge prompts can arrive here via LiteLLM role mapping). */
+  readonly firstUserText: string;
+  /** Joined system-message text, when the request carries one. */
+  readonly systemText: string;
+  /** Tool-call ids already present in the conversation. */
+  readonly toolCallIds: readonly string[];
   /** True when the conversation already contains tool output for this turn. */
   readonly sawToolOutput: boolean;
 }) => MockResponse | undefined;
@@ -22,6 +28,11 @@ export type MockScript = (input: {
 export interface MockObservation {
   readonly model: string;
   readonly lastUserText: string;
+  readonly firstUserText: string;
+  readonly systemText: string;
+  readonly toolCallIds: readonly string[];
+  /** Message roles in arrival order, for test diagnostics. */
+  readonly roles: string[];
   readonly sawToolOutput: boolean;
   /** Date.now() when the mock received the request (arrival evidence). */
   readonly receivedAt: number;
@@ -118,9 +129,27 @@ export class MockModelServer {
     const messages = parsed.messages ?? [];
     const sawToolOutput = messages.some((m) => m.role === "tool" || m.role === "function");
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const firstUser = messages.find((m) => m.role === "user");
+    // LiteLLM maps `system` to `developer` for some models; collect both.
+    const systemText = messages
+      .filter((m) => m.role === "system" || m.role === "developer")
+      .map((m) => textOf(m.content))
+      .join("\n");
+    const toolCallIds = messages
+      .filter((m) => m.role === "assistant")
+      .flatMap((m) => {
+        const calls = (m as { tool_calls?: unknown }).tool_calls;
+        return Array.isArray(calls) ? calls : [];
+      })
+      .map((tc) => String((tc as { id?: unknown }).id ?? ""))
+      .filter((id) => id !== "");
     const observation: MockObservation = {
       model,
       lastUserText: textOf(lastUser?.content),
+      firstUserText: textOf(firstUser?.content),
+      systemText,
+      toolCallIds,
+      roles: messages.map((m) => String(m.role)),
       sawToolOutput,
       receivedAt: Date.now(),
       path: req.url ?? "",

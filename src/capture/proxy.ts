@@ -248,6 +248,33 @@ export class CaptureProxy {
         res.end();
         return;
       }
+      if (req.url === "/checkpoint" && req.method === "POST") {
+        // S5-R1: resolve the last committed attempt of the ACTIVE session by
+        // explicit identity. Never a global newest-session lookup.
+        const activeSession = this.#window?.sessionId
+          ?? (this.#lastTurnBySession.size === 1 ? [...this.#lastTurnBySession.keys()][0] : undefined);
+        const turnId = activeSession !== undefined
+          ? (this.#window?.sessionId === activeSession ? this.#window.turnId : this.#lastTurnBySession.get(activeSession))
+          : undefined;
+        const turn = turnId !== undefined ? this.turns.get(turnId) : undefined;
+        if (turn === undefined || turn.captureState !== "committed" || turn.checkpointId === null) {
+          throw new IdentityError("no-committed-attempt", "no committed capture for the active session");
+        }
+        this.#options.trace.append("checkpoint.selected", {
+          turnId: turn.id,
+          checkpointId: turn.checkpointId,
+          sessionId: turn.sessionId,
+          messageId: turn.messageId,
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          checkpointId: turn.checkpointId,
+          sessionId: turn.sessionId,
+          messageId: turn.messageId,
+          turnId: turn.id,
+        }));
+        return;
+      }
       if (req.method !== "POST") {
         res.writeHead(405);
         res.end();
@@ -396,6 +423,12 @@ export class CaptureProxy {
       return;
     }
     const text = typeof d.text === "string" ? d.text : undefined;
+    // The checkpoint command itself is excluded from task selection: it
+    // never opens a turn or a capture (design.md; docs/step-5-requirements.md).
+    if (text !== undefined && text.trimStart().startsWith("!checkpoint")) {
+      this.#options.trace.append("checkpoint.command.excluded", { sessionId, messageId });
+      return;
+    }
     const key = `${sessionId}:${messageId}`;
     if (this.#identityToTurn.has(key)) {
       return;
