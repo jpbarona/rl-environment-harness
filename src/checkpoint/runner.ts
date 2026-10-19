@@ -115,6 +115,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
       attemptExcerpt: attemptExcerpt.slice(0, 2000),
       judgeModelPlaceholder: "JUDGE_MODEL_PLACEHOLDER",
       replayTransformations,
+      workspacePaths: listWorkspacePaths(replayDir),
     };
     const solverTag = `rl-task-${record.taskId}-solver`;
     const verifierTag = `rl-task-${record.taskId}-verifier`;
@@ -174,7 +175,7 @@ export async function runPipeline(jobId: string, configPath?: string): Promise<v
         "-v", `${join(built.taskDir, "tests")}:/tests:ro`,
         ...verifierEnvArgs(config),
         verifierTag,
-        "bash", "-c", "mkdir -p /tmp/ws /tmp/out && rewardkit /tests --workspace /tmp/ws --output /tmp/out/reward.json >/dev/null 2>/tmp/smoke-err.txt; cat /tmp/smoke-err.txt >&2; test -s /tmp/out/reward.json",
+        "bash", "-c", "mkdir -p /tmp/ws /tmp/out && python /tests/criteria_smoke.py /tests/checks.py && rewardkit /tests --workspace /tmp/ws --output /tmp/out/reward.json",
       ], 300_000);
       if (smoke.status === 0) {
         break;
@@ -688,4 +689,17 @@ export function mainRunner(argv: readonly string[]): void {
 
 if (process.argv[1]?.endsWith("runner.js")) {
   mainRunner(process.argv.slice(2));
+}
+
+function listWorkspacePaths(root: string): string[] {
+  const paths: string[] = [];
+  const walk = (dir: string, prefix: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = prefix + entry.name;
+      paths.push(path + (entry.isDirectory() ? "/" : ""));
+      if (entry.isDirectory()) walk(join(dir, entry.name), path + "/");
+    }
+  };
+  walk(root, "");
+  return paths.sort();
 }
