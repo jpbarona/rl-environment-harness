@@ -81,3 +81,5 @@ Images live in Docker's image store. `images.lock.json` inside each task records
 ### Grading regression contract
 
 The writer must preserve exact instructions; trimming or allowing an extra newline is not valid for an exact-byte task. It supplies 1–4 named negative-example scripts in `invalidExamples` (each starts from the reference solution) for task-specific validation. Older scripted fixtures may omit this optional envelope field. Failure to reject a supplied negative example blocks publication. `reward-components.json` retains raw components; `reward.json` contains the single gated reward. No partial credit is awarded just for preserving unrelated files when required task outcomes fail.
+
+Generated criteria are registration-tested before RewardKit execution. Repair feedback uses the concise exception type/message. `workspace_paths` contains the complete replay path list (including directories); `workspace_files` contains bounded excerpts and is not a complete path inventory. Existing hidden directories must not be treated as unwanted additions.

@@ -32,6 +32,7 @@ export interface WriterInput {
    * workspace before the writer sees it (provider scrub, plugin removal).
    */
   readonly replayTransformations?: readonly string[];
+  readonly workspacePaths?: readonly string[];
   /** The previous attempt's validation error, fed back on retry. */
   readonly previousError?: string;
 }
@@ -63,6 +64,7 @@ You produce a JSON object with these keys:
   rewardkit as rk and register criteria against the /app workspace. Use only
   deterministic built-ins (rk.file_exists, rk.file_contains, rk.command_succeeds,
   rk.json_key_equals, ...) or @criterion functions taking (workspace: Path).
+  For decorators, use @rk.criterion explicitly (rk is already imported).
   At least one criterion is required. Never read /tests, /logs, or network paths.
 - "judgeToml": either null, or a complete RewardKit judge TOML string. Use
   judge = "JUDGE_MODEL_PLACEHOLDER" literally; the harness substitutes the real
@@ -88,10 +90,11 @@ directory. NEVER pass isolated=True to any command criterion (the verifier canno
 provide filesystem isolation; the criteria smoke rejects the attempt). Built-in
 calls accept ONLY their positional arguments plus weight; @criterion accepts ONLY
 description and shared. NEVER pass name=, description=, or any other keyword to a
-built-in call. workspace_files lists the EXACT files present in /app at task
-start, after the recorded runtime transformations listed in
-replay_transformations. Preservation criteria may only require files that appear
-in workspace_files, and only the content shown there. Output ONLY the JSON
+built-in call. workspace_files contains BOUNDED CONTENT EXCERPTS, not a complete filesystem list.
+workspace_paths, when present, lists all starting paths, including directories.
+Preservation criteria must not treat pre-existing hidden directories as unwanted additions. Respect the
+recorded runtime transformations in replay_transformations. Do not invent original
+file contents beyond the excerpts. Output ONLY the JSON
 object, no markdown fence.`;
 
 export function buildWriterMessages(input: WriterInput): ChatMessage[] {
@@ -102,6 +105,7 @@ export function buildWriterMessages(input: WriterInput): ChatMessage[] {
     workspace_files: input.workspaceFiles,
     original_attempt_excerpt: input.attemptExcerpt,
     judge_model_placeholder: input.judgeModelPlaceholder,
+    ...(input.workspacePaths !== undefined ? { workspace_paths: input.workspacePaths } : {}),
   };
   if (input.replayTransformations !== undefined && input.replayTransformations.length > 0) {
     payload["replay_transformations"] = input.replayTransformations;
