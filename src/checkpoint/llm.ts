@@ -69,6 +69,9 @@ export async function chatCompletion(
       method: "POST",
       headers: {
         "content-type": "application/json",
+        // Docker fixture work can block this process between calls. Do not
+        // reuse an idle socket whose remote close has not been processed yet.
+        connection: "close",
         authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({

@@ -19,6 +19,7 @@ import { selectedTurnInput } from "../restore/request-compare.js";
 import type { SystemConfig } from "./config.js";
 import type { WriterOutput } from "./writer.js";
 import { readJsonl } from "./jsonl.js";
+import { describeWorkspace } from "./workspace-inventory.js";
 
 export interface BuiltTask {
   readonly taskDir: string;
@@ -174,7 +175,10 @@ export function buildHarborTask(options: {
   writeFileSync(join(testsDir, "test.sh"), verifierTestSh());
   chmodSync(join(testsDir, "test.sh"), 0o755);
   writeFileSync(join(testsDir, "checks.py"), writer.checksPy);
+  const baseline = Object.fromEntries(describeWorkspace(appDir).map((entry) => [entry.path, entry]));
+  writeFileSync(join(testsDir, "workspace_baseline.py"), `import json\nBASELINE = json.loads(${JSON.stringify(JSON.stringify(baseline))})\n`);
   writeFileSync(join(testsDir, "finalize_reward.py"), rewardFinalizerSource());
+  writeFileSync(join(testsDir, "criteria_smoke.py"), criteriaSmokeSource());
   if (writer.judgeToml !== null) {
     const substituted = writer.judgeToml.replaceAll("JUDGE_MODEL_PLACEHOLDER", config.judgeModel);
     writeFileSync(join(testsDir, "judge.toml"), substituted);
@@ -302,6 +306,7 @@ export function verifierTestSh(): string {
 # RewardKit entry point (S5-R6): one numeric solver reward.
 set -eu
 mkdir -p /logs/verifier
+export PYTHONPATH="/tests\${PYTHONPATH:+:$PYTHONPATH}"
 rewardkit /tests --workspace /app --output /logs/verifier/reward-components.json
 python /tests/finalize_reward.py /logs/verifier/reward-components.json /logs/verifier/reward.json /logs/verifier/reward-details.json
 cat /logs/verifier/reward.json
@@ -359,6 +364,22 @@ def main():
             raise ValueError("invalid or missing reward component: " + key)
     reward = scores["reward"] if scores["checks"] == 1 else 0.0
     destination.write_text(json.dumps({"reward": reward}) + "\\n")
+
+if __name__ == "__main__":
+    main()
+`;
+}
+
+/** Short registration errors survive bounded repair feedback; no judge call is made. */
+export function criteriaSmokeSource(): string {
+  return `import runpy, sys
+
+def main():
+    try:
+        runpy.run_path(sys.argv[1])
+    except Exception as error:
+        print(type(error).__name__ + ": " + str(error), file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

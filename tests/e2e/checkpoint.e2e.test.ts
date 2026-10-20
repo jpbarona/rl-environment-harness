@@ -110,6 +110,12 @@ function controlScript(): MockScript {
             "import rewardkit as rk",
             "rk.file_exists('selected-output.txt')",
             "from pathlib import Path",
+            "import os",
+            "from workspace_baseline import BASELINE",
+            "@rk.criterion(description='preserve the starting relative symlink')",
+            "def preserve_link(workspace: Path):",
+            "    p = workspace / 'link-to-notes'",
+            "    return p.is_symlink() and os.readlink(p) == BASELINE['link-to-notes']['target']",
             "@rk.criterion(description='exact result bytes')",
             "def exact(workspace: Path):",
             "    p = workspace / 'selected-output.txt'",
@@ -355,7 +361,7 @@ describe("S5-R4 writer repair retry across attempts", () => {
       verifierEnv: { OPENAI_API_KEY: "JUDGE_API_KEY", OPENAI_BASE_URL: "JUDGE_BASE_URL" },
       credentials: {},
       modelSpendCapUSD: 0.2,
-      retries: { writer: 3, reviewer: 1 },
+      retries: { writer: 4, reviewer: 1 },
     }, null, 2)}\n`);
     // The verifier's judge endpoint is this repair control mock.
     process.env["JUDGE_BASE_URL"] = `http://host.docker.internal:${new URL(repairControlURL).port}/v1`;
@@ -367,7 +373,7 @@ describe("S5-R4 writer repair retry across attempts", () => {
     }
   });
 
-  it("the repaired second attempt reaches validation and completes without an export collision", async () => {
+  it("repairs syntax, capabilities, empty output and semantic fixture failures without re-exporting", async () => {
     const run = await runCli(["checkpoint", "the agent did not create selected-output.txt"], retryConfigPath);
     expect(run.status, `queue failed: ${run.stderr}`).toBe(0);
     const queued = run.stdout.trim().split(" ")[1] ?? "";
@@ -392,6 +398,9 @@ describe("S5-R4 writer repair retry across attempts", () => {
     expect(log).toContain("criteria smoke failed; retrying the writer");
     expect(log).toContain("writer call failed; retrying with the error fed back: checksPy uses isolated=True");
     expect(log).toContain("finish_reason=stop");
+    expect(log).toContain("fixtures failed; retrying the writer");
+    expect(log).toContain("file_not_exists:link-to-notes");
+    expect(existsSync(join(jobDirPath, "attempts", "4", "validation.json"))).toBe(true);
     expect(log).toContain("retrying the writer with the previous validation error");
     expect(log).toContain("step validate: grading known correct and incorrect fixtures");
     expect(log).toMatch(/^[\s\S]*SCORED task=/);
@@ -401,7 +410,7 @@ describe("S5-R4 writer repair retry across attempts", () => {
   }, 1_200_000);
 });
 
-/** Writer fails three ways, then repairs: unsupported kwarg (smoke),
+/** Writer fails four ways, then repairs: unsupported kwarg (smoke),
  * isolated=True (capability guard), empty content (provider), then good. */
 function repairControlScript(): MockScript {
   const goodChecks = [
@@ -447,6 +456,7 @@ function repairControlScript(): MockScript {
       if (writerCalls === 1) return { content: JSON.stringify({ ...envelope, checksPy: kwargChecks }) };
       if (writerCalls === 2) return { content: JSON.stringify({ ...envelope, checksPy: isolatedChecks }) };
       if (writerCalls === 3) return { content: "" }; // provider returned nothing
+      if (writerCalls === 4) return { content: JSON.stringify({ ...envelope, checksPy: goodChecks + "rk.file_not_exists('link-to-notes')\n" }) }; // rejects a correct fixture's pre-existing symlink
       return { content: JSON.stringify({ ...envelope, checksPy: goodChecks }) };
     }
     if (prompt.includes("independent task-quality reviewer")) {
