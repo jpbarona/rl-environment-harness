@@ -33,8 +33,10 @@ export interface WriterInput {
    */
   readonly replayTransformations?: readonly string[];
   readonly workspacePaths?: readonly string[];
+  readonly workspaceEntries?: readonly { readonly path: string; readonly kind: "file" | "directory" | "symlink"; readonly target?: string; readonly sha256?: string }[];
   /** The previous attempt's validation error, fed back on retry. */
   readonly previousError?: string;
+  readonly previousTaskDefinition?: WriterOutput;
 }
 
 export interface WriterOutput {
@@ -65,7 +67,21 @@ You produce a JSON object with these keys:
   deterministic built-ins (rk.file_exists, rk.file_contains, rk.command_succeeds,
   rk.json_key_equals, ...) or @criterion functions taking (workspace: Path).
   For decorators, use @rk.criterion explicitly (rk is already imported).
-  At least one criterion is required. Never read /tests, /logs, or network paths.
+  Functions whose only argument is workspace auto-register. DO NOT call these
+  decorated functions again, especially not custom_check(weight=1.0). A working
+  pattern (adapt its outcome to THIS task) is:
+    import rewardkit as rk
+    from pathlib import Path
+    @rk.criterion(description="output exists and is nonempty")
+    def output_nonempty(workspace: Path):
+        p = workspace / "output.txt"
+        return p.is_file() and bool(p.read_bytes())
+  There is NO manual call after this definition.
+  At least one criterion is required. You may import the provided verifier-only
+  baseline with: from workspace_baseline import BASELINE
+  BASELINE maps each starting relative path to kind, sha256 (files), target
+  (symlinks). Import that data rather than transcribing hash strings. Apart from
+  this supplied baseline, never read /tests, /logs, or network paths.
 - "judgeToml": either null, or a complete RewardKit judge TOML string. Use
   judge = "JUDGE_MODEL_PLACEHOLDER" literally; the harness substitutes the real
   judge model. List graded files under files = ["/app/..."]. Use binary or
@@ -92,6 +108,14 @@ calls accept ONLY their positional arguments plus weight; @criterion accepts ONL
 description and shared. NEVER pass name=, description=, or any other keyword to a
 built-in call. workspace_files contains BOUNDED CONTENT EXCERPTS, not a complete filesystem list.
 workspace_paths, when present, lists all starting paths, including directories.
+workspace_entries explicitly distinguishes files, directories and symlinks, with
+symlink targets and SHA-256 hashes for regular files. ALL of these are pre-existing
+entries, not unwanted additions. For exact file preservation, compare hashlib.sha256
+of the finished bytes to BASELINE[path]["sha256"]. Never retype hashes from the prompt. No __starting__ directory exists; never
+invent a baseline path or skip comparisons when a made-up baseline is absent.
+A symlink such as link-to-notes must remain allowed; compare its target with
+os.readlink when preserving it, not a regular-file-only inventory. Build any
+no-extra-entries check from the COMPLETE starting inventory plus requested outputs.
 Preservation criteria must not treat pre-existing hidden directories as unwanted additions. Respect the
 recorded runtime transformations in replay_transformations. Do not invent original
 file contents beyond the excerpts. Output ONLY the JSON
@@ -106,13 +130,15 @@ export function buildWriterMessages(input: WriterInput): ChatMessage[] {
     original_attempt_excerpt: input.attemptExcerpt,
     judge_model_placeholder: input.judgeModelPlaceholder,
     ...(input.workspacePaths !== undefined ? { workspace_paths: input.workspacePaths } : {}),
+    ...(input.workspaceEntries !== undefined ? { workspace_entries: input.workspaceEntries } : {}),
   };
   if (input.replayTransformations !== undefined && input.replayTransformations.length > 0) {
     payload["replay_transformations"] = input.replayTransformations;
   }
   if (input.previousError !== undefined) {
     payload["previous_attempt_error"] = input.previousError;
-    payload["fix_required"] = "Your previous checksPy failed to run with the error above. Fix checksPy so RewardKit accepts it.";
+    if (input.previousTaskDefinition !== undefined) payload["previous_task_definition"] = input.previousTaskDefinition;
+    payload["fix_required"] = "Your previous task definition failed the validation above. Repair the verifier or reference solution to match the original request and complete starting inventory. Do not weaken exact-content or preservation constraints, special-case fixture names, or grant rewards for incorrect outcomes.";
   }
   return [
     { role: "system", content: WRITER_SYSTEM },

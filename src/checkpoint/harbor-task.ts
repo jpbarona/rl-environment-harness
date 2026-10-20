@@ -19,6 +19,7 @@ import { selectedTurnInput } from "../restore/request-compare.js";
 import type { SystemConfig } from "./config.js";
 import type { WriterOutput } from "./writer.js";
 import { readJsonl } from "./jsonl.js";
+import { describeWorkspace } from "./workspace-inventory.js";
 
 export interface BuiltTask {
   readonly taskDir: string;
@@ -174,6 +175,8 @@ export function buildHarborTask(options: {
   writeFileSync(join(testsDir, "test.sh"), verifierTestSh());
   chmodSync(join(testsDir, "test.sh"), 0o755);
   writeFileSync(join(testsDir, "checks.py"), writer.checksPy);
+  const baseline = Object.fromEntries(describeWorkspace(appDir).map((entry) => [entry.path, entry]));
+  writeFileSync(join(testsDir, "workspace_baseline.py"), `import json\nBASELINE = json.loads(${JSON.stringify(JSON.stringify(baseline))})\n`);
   writeFileSync(join(testsDir, "finalize_reward.py"), rewardFinalizerSource());
   writeFileSync(join(testsDir, "criteria_smoke.py"), criteriaSmokeSource());
   if (writer.judgeToml !== null) {
@@ -303,6 +306,7 @@ export function verifierTestSh(): string {
 # RewardKit entry point (S5-R6): one numeric solver reward.
 set -eu
 mkdir -p /logs/verifier
+export PYTHONPATH="/tests\${PYTHONPATH:+:$PYTHONPATH}"
 rewardkit /tests --workspace /app --output /logs/verifier/reward-components.json
 python /tests/finalize_reward.py /logs/verifier/reward-components.json /logs/verifier/reward.json /logs/verifier/reward-details.json
 cat /logs/verifier/reward.json
